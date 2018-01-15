@@ -91,7 +91,7 @@ class Updater
      * @param int $flags a few of the constants of this class
      * @param \DateTime $start
      */
-    public function update(IOInterface $io, Config $config, Package $package, RepositoryInterface $repository, $flags = 0, \DateTime $start = null)
+        public function update(IOInterface $io, Config $config, Package $package, RepositoryInterface $repository, $flags = 0, \DateTime $start = null)
     {
         $rfs = new RemoteFilesystem($io, $config);
         $blacklist = '{^symfony/symfony (2.0.[456]|dev-charset|dev-console)}i';
