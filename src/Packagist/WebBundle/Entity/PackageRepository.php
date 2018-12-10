@@ -166,7 +166,7 @@ class PackageRepository extends EntityRepository
                 'recent' => date('Y-m-d H:i:s', strtotime('-3hour')),
                 'yesterday' => date('Y-m-d H:i:s', strtotime('-1day')),
                 // crawl packages without auto-update once every 2week
-                'crawled' => date('Y-m-d H:i:s', strtotime('-5minute')),
+                'crawled' => date('Y-m-d H:i:s', strtotime('-2week')),
                 // crawl all packages including auto-updated once a month just in case
                 'autocrawled' => date('Y-m-d H:i:s', strtotime('-1month')),
             )
