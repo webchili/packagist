@@ -720,7 +720,7 @@ class SymlinkDumper
                 }
             } else {
                 foreach ($uniqKeys as $key) {
-                    $filtered[$key.'s'] = [$versionArray[$key]];
+                    $filtered[$key.'s'] = isset($versionArray[$key]) ? [$versionArray[$key]] : [''];
                 }
                 $deduplicatedVersions[$hash] = $filtered;
             }
