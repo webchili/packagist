@@ -21,7 +21,6 @@ framework:
         cookie_lifetime: 3600
         cookie_httponly: true
         save_path: '%session_save_path%'
-    trusted_proxies: '%trusted_proxies%'
     trusted_hosts: '%trusted_hosts%'
     http_method_override: true
     fragments: ~
@@ -50,7 +49,10 @@ doctrine:
         password: '%database_password%'
         charset:  utf8mb4
         # See https://github.com/sonata-project/SonataAdminBundle/issues/3342
-        server_version: 5.6
+        server_version: 8.0
+        options:
+            # PDO::ATTR_TIMEOUT
+            2: 1.3
     orm:
         auto_generate_proxy_classes: '%kernel.debug%'
         auto_mapping: true
@@ -62,13 +64,15 @@ snc_redis:
             alias: default
             dsn: '%redis_dsn%'
             options:
-                profile: 2.8
+                profile: 3.2
+                connection_timeout: 1
         cache:
             type: predis
             alias: cache
             dsn: '%redis_dsn%'
             options:
-                profile: 2.8
+                profile: 3.2
+                connection_timeout: 1
     session:
         client: cache
         prefix: 'sess:'
@@ -76,13 +80,29 @@ snc_redis:
 
 # Swiftmailer Configuration
 swiftmailer:
-    transport: '%mailer_transport%'
-    host:      '%mailer_host%'
-    username:  '%mailer_user%'
-    password:  '%mailer_password%'
-    encryption: '%mailer_encryption%'
-    auth_mode: '%mailer_auth_mode%'
-    spool:     { type: memory }
+    default_mailer: main
+    mailers:
+        # default main mailer for controllers and whatnot.. uses a memory spool
+        # to delay sending until end of the request
+        main:
+            transport: '%mailer_transport%'
+            host:      '%mailer_host%'
+            username:  '%mailer_user%'
+            password:  '%mailer_password%'
+            encryption: '%mailer_encryption%'
+            port: 587
+            auth_mode: '%mailer_auth_mode%'
+            spool:     { type: memory }
+        # fast mailer for background workers that does not spool but rather sends instantaneously
+        # request it to be injected by defining the argument as $instantMailer
+        instant:
+            transport: '%mailer_transport%'
+            host:      '%mailer_host%'
+            username:  '%mailer_user%'
+            password:  '%mailer_password%'
+            encryption: '%mailer_encryption%'
+            port: 587
+            auth_mode: '%mailer_auth_mode%'
 
 fos_user:
     db_driver:     orm
@@ -94,7 +114,7 @@ fos_user:
         sender_name:    '%mailer_from_name%'
     profile:
         form:
-            type:       packagist_user_profile
+            type: Packagist\WebBundle\Form\Type\ProfileFormType
 
 hwi_oauth:
     firewall_names: [main]
@@ -139,3 +159,6 @@ httplug:
             plugins: ['httplug.plugin.logger']
             config:
                 timeout: 2
+
+sensio_framework_extra:
+    router: { annotations: false }

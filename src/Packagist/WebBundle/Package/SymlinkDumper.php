@@ -20,6 +20,7 @@ use Symfony\Component\Finder\Finder;
 use Packagist\WebBundle\Entity\Version;
 use Packagist\WebBundle\Entity\Package;
 use Doctrine\DBAL\Connection;
+use Packagist\WebBundle\HealthCheck\MetadataDirCheck;
 use Predis\Client;
 
 /**
@@ -112,6 +113,11 @@ class SymlinkDumper
     private $compress;
 
     /**
+     * @var array
+     */
+    private $awsMeta;
+
+    /**
      * Constructor
      *
      * @param RegistryInterface     $doctrine
@@ -121,7 +127,7 @@ class SymlinkDumper
      * @param string                $targetDir
      * @param int                   $compress
      */
-    public function __construct(RegistryInterface $doctrine, Filesystem $filesystem, UrlGeneratorInterface $router, Client $redis, $webDir, $targetDir, $compress)
+    public function __construct(RegistryInterface $doctrine, Filesystem $filesystem, UrlGeneratorInterface $router, Client $redis, $webDir, $targetDir, $compress, $awsMetadata)
     {
         $this->doctrine = $doctrine;
         $this->fs = $filesystem;
@@ -131,6 +137,7 @@ class SymlinkDumper
         $this->buildDir = $targetDir;
         $this->compress = $compress;
         $this->redis = $redis;
+        $this->awsMeta = $awsMetadata;
     }
 
     /**
@@ -142,6 +149,10 @@ class SymlinkDumper
      */
     public function dump(array $packageIds, $force = false, $verbose = false)
     {
+        if (!MetadataDirCheck::isMetadataStoreMounted($this->awsMeta)) {
+            throw new \RuntimeException('Metadata store not mounted, can not dump metadata');
+        }
+
         $cleanUpOldFiles = date('i') == 0;
 
         // prepare build dir
@@ -281,8 +292,10 @@ class SymlinkDumper
 
                     // dump v2 format
                     $key = $name.'.json';
-                    $this->dumpPackageToV2File($package, $versionData, $key);
+                    $keyDev = $name.'~dev.json';
+                    $this->dumpPackageToV2File($package, $versionData, $key, $keyDev);
                     $modifiedV2Files[$key] = true;
+                    $modifiedV2Files[$keyDev] = true;
 
                     // store affected files to clean up properly in the next update
                     $this->fs->mkdir(dirname($buildDir.'/'.$name));
@@ -699,39 +712,68 @@ class SymlinkDumper
         $this->individualFilesV2Mtime = array();
     }
 
-    private function dumpPackageToV2File(Package $package, $versionData, string $packageKey)
+    private function dumpPackageToV2File(Package $package, $versionData, string $packageKey, string $packageKeyDev)
     {
-        $deduplicatedVersions = [];
-        $uniqKeys = ['version', 'version_normalized', 'source', 'dist', 'time'];
-        $mtime = 0;
-
-        foreach ($package->getVersions() as $version) {
-            $versionArray = $version->toV2Array($versionData);
-
-            $filtered = $versionArray;
-            foreach ($uniqKeys as $key) {
-                unset($filtered[$key]);
-            }
-            $hash = md5(json_encode($filtered));
-
-            if (isset($deduplicatedVersions[$hash])) {
-                foreach ($uniqKeys as $key) {
-                    $deduplicatedVersions[$hash][$key.'s'][] = $versionArray[$key] ?? null;
-                }
-            } else {
-                foreach ($uniqKeys as $key) {
-                    $filtered[$key.'s'] = [$versionArray[$key] ?? null];
-                }
-                $deduplicatedVersions[$hash] = $filtered;
-            }
-
-            $mtime = max($mtime, $version->getReleasedAt() ? $version->getReleasedAt()->getTimestamp() : time());
+        $versions = $package->getVersions();
+        if (is_object($versions)) {
+            $versions = $versions->toArray();
         }
 
-        // get rid of md5 hash keys
-        $deduplicatedVersions = array_values($deduplicatedVersions);
+        usort($versions, Package::class.'::sortVersions');
 
-        $this->individualFilesV2[$packageKey]['packages'][strtolower($package->getName())] = $deduplicatedVersions;
+        $tags = [];
+        $branches = [];
+        foreach ($versions as $version) {
+            if ($version->isDevelopment()) {
+                $branches[] = $version;
+            } else {
+                $tags[] = $version;
+            }
+        }
+
+        $this->dumpVersionsToV2File($package, $tags, $versionData, $packageKey);
+        $this->dumpVersionsToV2File($package, $branches, $versionData, $packageKeyDev);
+    }
+
+    private function dumpVersionsToV2File(Package $package, $versions, $versionData, string $packageKey)
+    {
+        $minifiedVersions = [];
+        $mtime = 0;
+
+        $lastKnownVersionData = null;
+        foreach ($versions as $version) {
+            $versionArray = $version->toV2Array($versionData);
+            $mtime = max($mtime, $version->getReleasedAt() ? $version->getReleasedAt()->getTimestamp() : time());
+
+            if (!$lastKnownVersionData) {
+                $lastKnownVersionData = $versionArray;
+                $minifiedVersions[] = $versionArray;
+                continue;
+            }
+
+            $minifiedVersion = [];
+
+            // add any changes from the previous version
+            foreach ($versionArray as $key => $val) {
+                if (!isset($lastKnownVersionData[$key]) || $lastKnownVersionData[$key] !== $val) {
+                    $minifiedVersion[$key] = $val;
+                    $lastKnownVersionData[$key] = $val;
+                }
+            }
+
+            // store any deletions from the previous version for keys missing in current one
+            foreach ($lastKnownVersionData as $key => $val) {
+                if (!isset($versionArray[$key])) {
+                    $minifiedVersion[$key] = "__unset";
+                    unset($lastKnownVersionData[$key]);
+                }
+            }
+
+            $minifiedVersions[] = $minifiedVersion;
+        }
+
+        $this->individualFilesV2[$packageKey]['packages'][strtolower($package->getName())] = $minifiedVersions;
+        $this->individualFilesV2[$packageKey]['minified'] = 'composer/2.0';
         $this->individualFilesV2Mtime[$packageKey] = $mtime;
     }
 

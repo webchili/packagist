@@ -19,10 +19,10 @@ use Packagist\WebBundle\Entity\VersionRepository;
 use Pagerfanta\Adapter\FixedAdapter;
 use Pagerfanta\Pagerfanta;
 use Sensio\Bundle\FrameworkExtraBundle\Configuration\Cache;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\Route;
 use Sensio\Bundle\FrameworkExtraBundle\Configuration\Template;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\Routing\Annotation\Route;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 
 /**
@@ -37,7 +37,7 @@ class ExploreController extends Controller
     public function exploreAction()
     {
         /** @var PackageRepository $pkgRepo */
-        $pkgRepo = $this->getDoctrine()->getRepository('PackagistWebBundle:Package');
+        $pkgRepo = $this->getDoctrine()->getRepository(Package::class);
         /** @var VersionRepository $verRepo */
         $verRepo = $this->get('packagist.version_repository');
         $newSubmitted = $pkgRepo->getQueryBuilderForNewestPackages()->setMaxResults(10)
@@ -93,10 +93,10 @@ class ExploreController extends Controller
 
             $popularIds = $redis->zrevrange(
                 'downloads:trending',
-                ($req->get('page', 1) - 1) * $perPage,
-                $req->get('page', 1) * $perPage - 1
+                (max(1, (int) $req->get('page', 1)) - 1) * $perPage,
+                max(1, (int) $req->get('page', 1)) * $perPage - 1
             );
-            $popular = $this->getDoctrine()->getRepository('PackagistWebBundle:Package')
+            $popular = $this->getDoctrine()->getRepository(Package::class)
                 ->createQueryBuilder('p')->where('p.id IN (:ids)')->setParameter('ids', $popularIds)
                 ->getQuery()->useResultCache(true, 900)->getResult();
             usort($popular, function ($a, $b) use ($popularIds) {

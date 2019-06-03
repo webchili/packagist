@@ -17,8 +17,10 @@ use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Helper\HelperSet;
 use Monolog\Handler\StreamHandler;
 use Packagist\WebBundle\Entity\Package;
+use Packagist\WebBundle\Entity\Version;
 use Packagist\WebBundle\Package\Updater;
 use Packagist\WebBundle\Entity\Job;
+use Packagist\WebBundle\Entity\EmptyReferenceCache;
 use Packagist\WebBundle\Model\PackageManager;
 use Packagist\WebBundle\Model\DownloadManager;
 use Seld\Signal\SignalHandler;
@@ -83,22 +85,53 @@ class UpdaterWorker
 
         try {
             $flags = 0;
+            $useVersionCache = true;
             if ($job->getPayload()['update_equal_refs'] === true) {
                 $flags = Updater::UPDATE_EQUAL_REFS;
+                $useVersionCache = false;
             }
             if ($job->getPayload()['delete_before'] === true) {
                 $flags = Updater::DELETE_BEFORE;
+                $useVersionCache = false;
             }
 
             // prepare dependencies
             $loader = new ValidatingArrayLoader(new ArrayLoader());
 
+            $versionCache = null;
+            $existingVersions = null;
+            $emptyRefCache = $em->getRepository(EmptyReferenceCache::class)->findOneBy(['package' => $package]);
+            if (!$emptyRefCache) {
+                $emptyRefCache = new EmptyReferenceCache($package);
+                $em->persist($emptyRefCache);
+                $em->flush($emptyRefCache);
+            }
+
+            if ($useVersionCache) {
+                $existingVersions = $em->getRepository(Version::class)->getVersionMetadataForUpdate($package);
+
+                $versionCache = new VersionCache($package, $existingVersions, $emptyRefCache->getEmptyReferences());
+            } else {
+                $emptyRefCache->setEmptyReferences([]);
+            }
+
             // prepare repository
-            $repository = new VcsRepository(array('url' => $package->getRepository()), $io, $config);
+            $repository = new VcsRepository(
+                ['url' => $package->getRepository(), 'options' => ['retry-auth-failure' => false]],
+                $io,
+                $config,
+                null,
+                null,
+                $versionCache
+            );
             $repository->setLoader($loader);
 
             // perform the actual update (fetch and re-scan the repository's source)
-            $package = $this->updater->update($io, $config, $package, $repository, $flags);
+            $package = $this->updater->update($io, $config, $package, $repository, $flags, $existingVersions);
+
+            $emptyRefCache = $em->merge($emptyRefCache);
+            $emptyRefCache->setEmptyReferences($repository->getEmptyReferences());
+            $em->flush($emptyRefCache);
 
             // github update downgraded to a git clone, this should not happen, so check through API whether the package still exists
             if (preg_match('{[@/]github.com[:/]([^/]+/[^/]+?)(\.git)?$}i', $package->getRepository(), $match) && 0 === strpos($repository->getDriver()->getUrl(), 'git@')) {
@@ -209,8 +242,16 @@ class UpdaterWorker
         return [
             'status' => Job::STATUS_COMPLETED,
             'message' => 'Update of '.$packageName.' complete',
-            'details' => '<pre>'.$io->getOutput().'</pre>'
+            'details' => '<pre>'.$this->cleanupOutput($io->getOutput()).'</pre>'
         ];
+    }
+
+    private function cleanupOutput($str)
+    {
+        return preg_replace('{
+            Reading\ composer.json\ of\ <span(.+?)>(?P<pkg>[^<]+)</span>\ \(<span(.+?)>(?P<version>[^<]+)</span>\)\r?\n
+            (?P<cache>Found\ cached\ composer.json\ of\ <span(.+?)>(?P=pkg)</span>\ \(<span(.+?)>(?P=version)</span>\)\r?\n)
+        }x', '$5', $str);
     }
 
     private function checkForDeadGitHubPackage(Package $package, $match, $io, $output)
@@ -227,7 +268,6 @@ class UpdaterWorker
                         // remove packages with very low downloads and that are 404
                         && $this->downloadManager->getTotalDownloads($package) <= 100
                     ) {
-                        $name = $package->getName();
                         $this->packageManager->deletePackage($package);
 
                         return [

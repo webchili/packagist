@@ -14,19 +14,20 @@ namespace Packagist\WebBundle\Controller;
 
 use Doctrine\ORM\NoResultException;
 use FOS\UserBundle\Model\UserInterface;
-use Packagist\WebBundle\Entity\Package;
-use Packagist\WebBundle\Entity\User;
 use Packagist\WebBundle\Entity\Job;
+use Packagist\WebBundle\Entity\Package;
+use Packagist\WebBundle\Entity\Version;
+use Packagist\WebBundle\Entity\User;
+use Packagist\WebBundle\Entity\VersionRepository;
 use Packagist\WebBundle\Model\RedisAdapter;
 use Pagerfanta\Adapter\DoctrineORMAdapter;
 use Pagerfanta\Pagerfanta;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\Method;
 use Sensio\Bundle\FrameworkExtraBundle\Configuration\ParamConverter;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\Route;
 use Sensio\Bundle\FrameworkExtraBundle\Configuration\Template;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+use Symfony\Component\Routing\Annotation\Route;
 use Symfony\Component\Security\Core\Exception\AccessDeniedException;
 
 /**
@@ -53,11 +54,11 @@ class UserController extends Controller
     /**
      * @Route("/trigger-github-sync/", name="user_github_sync")
      */
-    public function triggerGitHubSyncAction(Request $req)
+    public function triggerGitHubSyncAction()
     {
         $user = $this->getUser();
         if (!$user) {
-            throw new \AccessDeniedException();
+            throw new AccessDeniedException();
         }
 
         if (!$user->getGithubToken()) {
@@ -82,9 +83,8 @@ class UserController extends Controller
     }
 
     /**
-     * @Route("/spammers/{name}/", name="mark_spammer")
+     * @Route("/spammers/{name}/", name="mark_spammer", methods={"POST"})
      * @ParamConverter("user", options={"mapping": {"name": "username"}})
-     * @Method({"POST"})
      */
     public function markSpammerAction(Request $req, User $user)
     {
@@ -109,9 +109,9 @@ class UserController extends Controller
             );
 
             /** @var VersionRepository $versionRepo */
-            $versionRepo = $doctrine->getRepository('PackagistWebBundle:Version');
+            $versionRepo = $doctrine->getRepository(Version::class);
             $packages = $doctrine
-                ->getRepository('PackagistWebBundle:Package')
+                ->getRepository(Package::class)
                 ->getFilteredQueryBuilder(array('maintainer' => $user->getId()), true)
                 ->getQuery()->getResult();
 
@@ -204,9 +204,8 @@ class UserController extends Controller
 
     /**
      * @Template()
-     * @Route("/users/{name}/favorites/", name="user_favorites")
+     * @Route("/users/{name}/favorites/", name="user_favorites", methods={"GET"})
      * @ParamConverter("user", options={"mapping": {"name": "username"}})
-     * @Method({"GET"})
      */
     public function favoritesAction(Request $req, User $user)
     {
@@ -232,9 +231,8 @@ class UserController extends Controller
     }
 
     /**
-     * @Route("/users/{name}/favorites/", name="user_add_fav", defaults={"_format" = "json"})
+     * @Route("/users/{name}/favorites/", name="user_add_fav", defaults={"_format" = "json"}, methods={"POST"})
      * @ParamConverter("user", options={"mapping": {"name": "username"}})
-     * @Method({"POST"})
      */
     public function postFavoriteAction(Request $req, User $user)
     {
@@ -245,7 +243,7 @@ class UserController extends Controller
         $package = $req->request->get('package');
         try {
             $package = $this->getDoctrine()
-                ->getRepository('PackagistWebBundle:Package')
+                ->getRepository(Package::class)
                 ->findOneByName($package);
         } catch (NoResultException $e) {
             throw new NotFoundHttpException('The given package "'.$package.'" was not found.');
@@ -257,10 +255,9 @@ class UserController extends Controller
     }
 
     /**
-     * @Route("/users/{name}/favorites/{package}", name="user_remove_fav", defaults={"_format" = "json"}, requirements={"package"="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?"})
+     * @Route("/users/{name}/favorites/{package}", name="user_remove_fav", defaults={"_format" = "json"}, requirements={"package"="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?"}, methods={"DELETE"})
      * @ParamConverter("user", options={"mapping": {"name": "username"}})
      * @ParamConverter("package", options={"mapping": {"package": "name"}})
-     * @Method({"DELETE"})
      */
     public function deleteFavoriteAction(User $user, Package $package)
     {
@@ -281,7 +278,7 @@ class UserController extends Controller
     protected function getUserPackages($req, $user)
     {
         $packages = $this->getDoctrine()
-            ->getRepository('PackagistWebBundle:Package')
+            ->getRepository(Package::class)
             ->getFilteredQueryBuilder(array('maintainer' => $user->getId()), true);
 
         $paginator = new Pagerfanta(new DoctrineORMAdapter($packages, true));

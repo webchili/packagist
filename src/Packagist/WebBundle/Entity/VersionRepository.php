@@ -79,6 +79,21 @@ class VersionRepository extends EntityRepository
         return $refreshedVersions;
     }
 
+    /**
+     * @param Version[] $versions
+     */
+    public function detachToArray(array $versions, array $versionData): array
+    {
+        $res = [];
+        $em = $this->getEntityManager();
+        foreach ($versions as $version) {
+            $res[$version->getVersion()] = $version->toArray($versionData);
+            $em->detach($version);
+        }
+
+        return $res;
+    }
+
     public function getVersionData(array $versionIds)
     {
         $links = [
@@ -142,7 +157,7 @@ class VersionRepository extends EntityRepository
     public function getVersionMetadataForUpdate(Package $package)
     {
         $rows = $this->getEntityManager()->getConnection()->fetchAll(
-            'SELECT id, normalizedVersion, source, softDeletedAt FROM package_version v WHERE v.package_id = :id',
+            'SELECT id, version, normalizedVersion, source, softDeletedAt FROM package_version v WHERE v.package_id = :id',
             ['id' => $package->getId()]
         );
 

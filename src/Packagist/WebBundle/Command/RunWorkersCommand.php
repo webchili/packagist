@@ -6,11 +6,24 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Filesystem\LockHandler;
-use Symfony\Bundle\FrameworkBundle\Command\ContainerAwareCommand;
+use Symfony\Component\Console\Command\Command;
 use Seld\Signal\SignalHandler;
+use Packagist\WebBundle\Service\QueueWorker;
+use Psr\Log\LoggerInterface;
 
-class RunWorkersCommand extends ContainerAwareCommand
+class RunWorkersCommand extends Command
 {
+    private $logger;
+    private $worker;
+
+    public function __construct(LoggerInterface $logger, QueueWorker $worker)
+    {
+        $this->logger = $logger;
+        $this->worker = $worker;
+
+        parent::__construct();
+    }
+
     protected function configure()
     {
         $this
@@ -23,7 +36,10 @@ class RunWorkersCommand extends ContainerAwareCommand
 
     protected function execute(InputInterface $input, OutputInterface $output)
     {
+        \Monolog\ErrorHandler::register($this->logger);
+
         $lock = new LockHandler('packagist_run_' . $input->getOption('worker-id'));
+        ini_set('memory_limit', '1G');
 
         // another dumper is still active
         if (!$lock->lock()) {
@@ -34,16 +50,12 @@ class RunWorkersCommand extends ContainerAwareCommand
         }
 
         try {
-            $logger = $this->getContainer()->get('logger');
+            $this->logger->notice('Worker started successfully');
+            $this->logger->reset();
 
-            $worker = $this->getContainer()->get('packagist.queue_worker');
+            $this->worker->processMessages((int) $input->getOption('messages'));
 
-            $logger->notice('Worker started successfully');
-            $this->getContainer()->get('packagist.log_resetter')->reset();
-
-            $worker->processMessages((int) $input->getOption('messages'));
-
-            $logger->notice('Worker exiting successfully');
+            $this->logger->notice('Worker exiting successfully');
         } finally {
             $lock->release();
         }

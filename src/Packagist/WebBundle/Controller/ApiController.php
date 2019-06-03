@@ -12,24 +12,13 @@
 
 namespace Packagist\WebBundle\Controller;
 
-use Composer\Console\HtmlOutputFormatter;
-use Composer\Factory;
-use Composer\IO\BufferIO;
-use Composer\Package\Loader\ArrayLoader;
-use Composer\Package\Loader\ValidatingArrayLoader;
-use Composer\Repository\InvalidRepositoryException;
-use Composer\Repository\VcsRepository;
 use Packagist\WebBundle\Entity\Package;
 use Packagist\WebBundle\Entity\User;
-use Packagist\WebBundle\Entity\Job;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\Method;
 use Sensio\Bundle\FrameworkExtraBundle\Configuration\ParamConverter;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\Route;
-use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
-use Symfony\Component\HttpFoundation\NotFoundHttpException;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Routing\Annotation\Route;
 use Symfony\Component\Security\Core\Exception\AccessDeniedException;
 
 /**
@@ -38,8 +27,7 @@ use Symfony\Component\Security\Core\Exception\AccessDeniedException;
 class ApiController extends Controller
 {
     /**
-     * @Route("/packages.json", name="packages", defaults={"_format" = "json"})
-     * @Method({"GET"})
+     * @Route("/packages.json", name="packages", defaults={"_format" = "json"}, methods={"GET"})
      */
     public function packagesAction()
     {
@@ -59,8 +47,7 @@ class ApiController extends Controller
     }
 
     /**
-     * @Route("/api/create-package", name="generic_create", defaults={"_format" = "json"})
-     * @Method({"POST"})
+     * @Route("/api/create-package", name="generic_create", defaults={"_format" = "json"}, methods={"POST"})
      */
     public function createPackageAction(Request $request)
     {
@@ -70,7 +57,7 @@ class ApiController extends Controller
         }
         $url = $payload['repository']['url'];
         $package = new Package;
-        $package->setEntityRepository($this->getDoctrine()->getRepository('PackagistWebBundle:Package'));
+        $package->setEntityRepository($this->getDoctrine()->getRepository(Package::class));
         $package->setRouter($this->get('router'));
         $user = $this->findUser($request);
         $package->addMaintainer($user);
@@ -96,10 +83,9 @@ class ApiController extends Controller
     }
 
     /**
-     * @Route("/api/update-package", name="generic_postreceive", defaults={"_format" = "json"})
-     * @Route("/api/github", name="github_postreceive", defaults={"_format" = "json"})
-     * @Route("/api/bitbucket", name="bitbucket_postreceive", defaults={"_format" = "json"})
-     * @Method({"POST"})
+     * @Route("/api/update-package", name="generic_postreceive", defaults={"_format" = "json"}, methods={"POST"})
+     * @Route("/api/github", name="github_postreceive", defaults={"_format" = "json"}, methods={"POST"})
+     * @Route("/api/bitbucket", name="bitbucket_postreceive", defaults={"_format" = "json"}, methods={"POST"})
      */
     public function updatePackageAction(Request $request)
     {
@@ -138,10 +124,10 @@ class ApiController extends Controller
      *     "/api/packages/{package}",
      *     name="api_edit_package",
      *     requirements={"package"="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?"},
-     *     defaults={"_format" = "json"}
+     *     defaults={"_format" = "json"},
+     *     methods={"PUT"}
      * )
      * @ParamConverter("package", options={"mapping": {"package": "name"}})
-     * @Method({"PUT"})
      */
     public function editPackageAction(Request $request, Package $package)
     {
@@ -175,8 +161,7 @@ class ApiController extends Controller
     }
 
     /**
-     * @Route("/downloads/{name}", name="track_download", requirements={"name"="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"}, defaults={"_format" = "json"})
-     * @Method({"POST"})
+     * @Route("/downloads/{name}", name="track_download", requirements={"name"="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"}, defaults={"_format" = "json"}, methods={"POST"})
      */
     public function trackDownloadAction(Request $request, $name)
     {
@@ -192,10 +177,9 @@ class ApiController extends Controller
     }
 
     /**
-     * @Route("/jobs/{id}", name="get_job", requirements={"id"="[a-f0-9]+"}, defaults={"_format" = "json"})
-     * @Method({"GET"})
+     * @Route("/jobs/{id}", name="get_job", requirements={"id"="[a-f0-9]+"}, defaults={"_format" = "json"}, methods={"GET"})
      */
-    public function getJobAction(Request $request, string $id)
+    public function getJobAction(string $id)
     {
         return new JsonResponse($this->get('scheduler')->getJobStatus($id), 200);
     }
@@ -212,8 +196,7 @@ class ApiController extends Controller
      *
      * The version must be the normalized one
      *
-     * @Route("/downloads/", name="track_download_batch", defaults={"_format" = "json"})
-     * @Method({"POST"})
+     * @Route("/downloads/", name="track_download_batch", defaults={"_format" = "json"}, methods={"POST"})
      */
     public function trackDownloadsAction(Request $request)
     {
@@ -288,6 +271,7 @@ class ApiController extends Controller
         $packages = null;
         $user = null;
         $autoUpdated = Package::AUTO_MANUAL_HOOK;
+        $receiveType = 'manual';
 
         // manual hook set up with user API token as secret
         if ($match['host'] === 'github.com' && $request->getContent() && $request->query->has('username') && $request->headers->has('X-Hub-Signature')) {
@@ -300,6 +284,7 @@ class ApiController extends Controller
                 if (hash_equals($expected, $sig)) {
                     $packages = $this->findPackagesByRepository('https://github.com/'.$match['path']);
                     $autoUpdated = Package::AUTO_GITHUB_HOOK;
+                    $receiveType = 'github_user_secret';
                 } else {
                     return new Response(json_encode(array('status' => 'error', 'message' => 'Secret should be the Packagist API Token for the Packagist user "'.$username.'". Signature verification failed.')), 403);
                 }
@@ -321,6 +306,7 @@ class ApiController extends Controller
                 if (hash_equals($expected, $sig)) {
                     $packages = $this->findPackagesByRepository('https://github.com/'.$match['path']);
                     $autoUpdated = Package::AUTO_GITHUB_HOOK;
+                    $receiveType = 'github_auto';
                 }
             }
         }
@@ -338,7 +324,6 @@ class ApiController extends Controller
             return new Response(json_encode(array('status' => 'error', 'message' => 'Could not find a package that matches this request (does user maintain the package?)')), 404);
         }
 
-        // put both updating the database and scanning the repository in a transaction
         $em = $this->get('doctrine.orm.entity_manager');
         $jobs = [];
 
@@ -351,7 +336,7 @@ class ApiController extends Controller
             $jobs[] = $job->getId();
         }
 
-        return new JsonResponse(['status' => 'success', 'jobs' => $jobs], 202);
+        return new JsonResponse(['status' => 'success', 'jobs' => $jobs, 'type' => $receiveType], 202);
     }
 
     /**
@@ -421,6 +406,6 @@ class ApiController extends Controller
      */
     protected function findPackagesByRepository(string $url): array
     {
-        return $this->getDoctrine()->getRepository('PackagistWebBundle:Package')->findBy(['repository' => $url]);
+        return $this->getDoctrine()->getRepository(Package::class)->findBy(['repository' => $url]);
     }
 }

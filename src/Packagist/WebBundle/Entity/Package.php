@@ -191,16 +191,15 @@ class Package
     public function toArray(VersionRepository $versionRepo)
     {
         $versions = array();
-        $versionIds = [];
-        $this->versions = $versionRepo->refreshVersions($this->getVersions());
-        foreach ($this->getVersions() as $version) {
-            $versionIds[] = $version->getId();
+        $partialVersions = $this->getVersions()->toArray();
+
+        while ($partialVersions) {
+            $slice = array_splice($partialVersions, 0, 100);
+            $fullVersions = $versionRepo->refreshVersions($slice);
+            $versionData = $versionRepo->getVersionData(array_map(function ($v) { return $v->getId(); }, $fullVersions));
+            $versions = array_merge($versions, $versionRepo->detachToArray($fullVersions, $versionData));
         }
-        $versionData = $versionRepo->getVersionData($versionIds);
-        foreach ($this->getVersions() as $version) {
-            /** @var $version Version */
-            $versions[$version->getVersion()] = $version->toArray($versionData);
-        }
+
         $maintainers = array();
         foreach ($this->getMaintainers() as $maintainer) {
             /** @var $maintainer User */
@@ -288,7 +287,7 @@ class Package
                 return;
             }
 
-            if (preg_match('{(free.*watch|watch.*free|movie.*free|free.*movie|watch.*movie|watch.*full|generate.*resource|generate.*unlimited|hack.*coin|coin.*hack|v[.-]?bucks|(fortnite|pubg).*free|hack.*cheat|cheat.*hack|putlocker)}i', $information['name'])) {
+            if (preg_match('{(free.*watch|watch.*free|(stream|online).*anschauver.*pelicula|ver.*completa|pelicula.*complet|season.*episode.*online|film.*(complet|entier)|(voir|regarder|guarda|assistir).*(film|complet)|full.*movie|online.*(free|tv|full.*hd)|(free|full|gratuit).*stream|movie.*free|free.*(movie|hack)|watch.*movie|watch.*full|generate.*resource|generate.*unlimited|hack.*coin|coin.*(hack|generat)|vbucks|hack.*cheat|hack.*generat|generat.*hack|hack.*unlimited|cheat.*(unlimited|generat)|(mod|cheat|apk).*(hack|cheat|mod)|hack.*(apk|mod|free|gold|gems|diamonds|coin)|putlocker|generat.*free|coins.*generat|(download|telecharg).*album|album.*(download|telecharg)|album.*(free|gratuit)|generat.*coins|unlimited.*coins|(fortnite|pubg|apex.*legend|t[1i]k.*t[o0]k).*(free|gratuit|generat|unlimited|coins|mobile|hack|follow))}i', str_replace(array('.', '-'), '', $information['name']))) {
                 $context->buildViolation('The package name '.htmlentities($information['name'], ENT_COMPAT, 'utf-8').' is blocked, if you think this is a mistake please get in touch with us.')
                     ->atPath($property)
                     ->addViolation()
@@ -905,6 +904,10 @@ class Package
 
         // equal versions are sorted by date
         if ($aVersion === $bVersion) {
+            // make sure sort is stable
+            if ($a->getReleasedAt() == $b->getReleasedAt()) {
+                return $a->getNormalizedVersion() <=> $b->getNormalizedVersion();
+            }
             return $b->getReleasedAt() > $a->getReleasedAt() ? 1 : -1;
         }
 

@@ -15,7 +15,7 @@ namespace Packagist\WebBundle\Model;
 use Symfony\Bridge\Doctrine\RegistryInterface;
 use Packagist\WebBundle\Entity\Package;
 use Psr\Log\LoggerInterface;
-use AlgoliaSearch\Client as AlgoliaClient;
+use Algolia\AlgoliaSearch\SearchClient;
 use Packagist\WebBundle\Service\GitHubUserMigrationWorker;
 
 /**
@@ -25,6 +25,7 @@ class PackageManager
 {
     protected $doctrine;
     protected $mailer;
+    protected $instantMailer;
     protected $twig;
     protected $logger;
     protected $options;
@@ -34,10 +35,11 @@ class PackageManager
     protected $githubWorker;
     protected $metadataDir;
 
-    public function __construct(RegistryInterface $doctrine, \Swift_Mailer $mailer, \Twig_Environment $twig, LoggerInterface $logger, array $options, ProviderManager $providerManager, AlgoliaClient $algoliaClient, string $algoliaIndexName, GitHubUserMigrationWorker $githubWorker, string $metadataDir)
+    public function __construct(RegistryInterface $doctrine, \Swift_Mailer $mailer, \Swift_Mailer $instantMailer, \Twig_Environment $twig, LoggerInterface $logger, array $options, ProviderManager $providerManager, SearchClient $algoliaClient, string $algoliaIndexName, GitHubUserMigrationWorker $githubWorker, string $metadataDir)
     {
         $this->doctrine = $doctrine;
         $this->mailer = $mailer;
+        $this->instantMailer = $instantMailer;
         $this->twig = $twig;
         $this->logger = $logger;
         $this->options = $options;
@@ -59,19 +61,31 @@ class PackageManager
         if ($package->getAutoUpdated() === Package::AUTO_GITHUB_HOOK) {
             foreach ($package->getMaintainers() as $maintainer) {
                 $token = $maintainer->getGithubToken();
-                if ($token && $this->githubWorker->deleteWebHook($token, $package)) {
-                    break;
+                try {
+                    if ($token && $this->githubWorker->deleteWebHook($token, $package)) {
+                        break;
+                    }
+                } catch (\GuzzleHttp\Exception\TransferException $e) {
+                    // ignore
                 }
             }
         }
 
+        $em = $this->doctrine->getManager();
+
         $downloadRepo = $this->doctrine->getRepository('PackagistWebBundle:Download');
         $downloadRepo->deletePackageDownloads($package);
+
+        $emptyRefRepo = $this->doctrine->getRepository('PackagistWebBundle:EmptyReferenceCache');
+        $emptyRef = $emptyRefRepo->findOneBy(['package' => $package]);
+        if ($emptyRef) {
+            $em->remove($emptyRef);
+            $em->flush();
+        }
 
         $this->providerManager->deletePackage($package);
         $packageName = $package->getName();
 
-        $em = $this->doctrine->getManager();
         $em->remove($package);
         $em->flush();
 
@@ -81,6 +95,13 @@ class PackageManager
         }
         if (file_exists($metadataV2.'.gz')) {
             @unlink($metadataV2.'.gz');
+        }
+        $metadataV2Dev = $this->metadataDir.'/p2/'.strtolower($packageName).'~dev.json';
+        if (file_exists($metadataV2Dev)) {
+            @unlink($metadataV2Dev);
+        }
+        if (file_exists($metadataV2Dev.'.gz')) {
+            @unlink($metadataV2Dev.'.gz');
         }
 
         // attempt search index cleanup
@@ -104,14 +125,14 @@ class PackageManager
             }
 
             if ($recipients) {
-                $body = $this->twig->render('PackagistWebBundle:Email:update_failed.txt.twig', array(
+                $body = $this->twig->render('PackagistWebBundle:email:update_failed.txt.twig', array(
                     'package' => $package,
                     'exception' => get_class($e),
                     'exceptionMessage' => $e->getMessage(),
                     'details' => strip_tags($details),
                 ));
 
-                $message = \Swift_Message::newInstance()
+                $message = (new \Swift_Message)
                     ->setSubject($package->getName().' failed to update, invalid composer.json data')
                     ->setFrom($this->options['from'], $this->options['fromName'])
                     ->setTo($recipients)
@@ -119,7 +140,7 @@ class PackageManager
                 ;
 
                 try {
-                    $this->mailer->send($message);
+                    $this->instantMailer->send($message);
                 } catch (\Swift_TransportException $e) {
                     $this->logger->error('['.get_class($e).'] '.$e->getMessage());
 
@@ -136,11 +157,11 @@ class PackageManager
 
     public function notifyNewMaintainer($user, $package)
     {
-        $body = $this->twig->render('PackagistWebBundle:Email:maintainer_added.txt.twig', array(
+        $body = $this->twig->render('PackagistWebBundle:email:maintainer_added.txt.twig', array(
             'package_name' => $package->getName()
         ));
 
-        $message = \Swift_Message::newInstance()
+        $message = (new \Swift_Message)
             ->setSubject('You have been added to ' . $package->getName() . ' as a maintainer')
             ->setFrom($this->options['from'], $this->options['fromName'])
             ->setTo($user->getEmail())

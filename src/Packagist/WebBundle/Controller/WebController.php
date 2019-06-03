@@ -17,10 +17,9 @@ use Packagist\WebBundle\Form\Type\SearchQueryType;
 use Predis\Connection\ConnectionException;
 use Sensio\Bundle\FrameworkExtraBundle\Configuration\Cache;
 use Sensio\Bundle\FrameworkExtraBundle\Configuration\Template;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\Method;
-use Sensio\Bundle\FrameworkExtraBundle\Configuration\Route;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\Routing\Annotation\Route;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
 
 /**
@@ -38,7 +37,7 @@ class WebController extends Controller
     }
 
     /**
-     * Rendered by views/Web/searchSection.html.twig
+     * Rendered by views/Web/search_section.html.twig
      */
     public function searchFormAction(Request $req)
     {
@@ -47,29 +46,25 @@ class WebController extends Controller
         ]);
 
         $filteredOrderBys = $this->getFilteredOrderedBys($req);
-        $normalizedOrderBys = $this->getNormalizedOrderBys($filteredOrderBys);
 
         $this->computeSearchQuery($req, $filteredOrderBys);
 
         $form->handleRequest($req);
 
-        $orderBysViewModel = $this->getOrderBysViewModel($req, $normalizedOrderBys);
-        return $this->render('PackagistWebBundle:Web:searchForm.html.twig', array(
+        return $this->render('PackagistWebBundle:web:search_form.html.twig', array(
             'searchQuery' => $req->query->get('search_query')['query'] ?? '',
         ));
     }
 
     /**
-     * @Route("/search/", name="search.ajax")
-     * @Route("/search.{_format}", requirements={"_format"="(html|json)"}, name="search", defaults={"_format"="html"})
-     * @Method({"GET"})
+     * @Route("/search/", name="search.ajax", methods={"GET"})
+     * @Route("/search.{_format}", requirements={"_format"="(html|json)"}, name="search", defaults={"_format"="html"}, methods={"GET"})
      */
     public function searchAction(Request $req)
     {
         $form = $this->createForm(SearchQueryType::class, new SearchQuery());
 
         $filteredOrderBys = $this->getFilteredOrderedBys($req);
-        $normalizedOrderBys = $this->getNormalizedOrderBys($filteredOrderBys);
 
         $this->computeSearchQuery($req, $filteredOrderBys);
 
@@ -77,7 +72,7 @@ class WebController extends Controller
         $tagsFilter = $req->query->get('tags');
 
         if ($req->getRequestFormat() !== 'json') {
-            return $this->render('PackagistWebBundle:Web:search.html.twig', [
+            return $this->render('PackagistWebBundle:web:search.html.twig', [
                 'packages' => [],
             ]);
         }
@@ -332,85 +327,6 @@ class WebController extends Controller
         }
 
         return $filteredOrderBys;
-    }
-
-    /**
-     * @param array $orderBys
-     *
-     * @return array
-     */
-    protected function getNormalizedOrderBys(array $orderBys)
-    {
-        $normalizedOrderBys = array();
-
-        foreach ($orderBys as $sort) {
-            $normalizedOrderBys[$sort['sort']] = $sort['order'];
-        }
-
-        return $normalizedOrderBys;
-    }
-
-    /**
-     * @param Request $req
-     * @param array $normalizedOrderBys
-     *
-     * @return array
-     */
-    protected function getOrderBysViewModel(Request $req, array $normalizedOrderBys)
-    {
-        $makeDefaultArrow = function ($sort) use ($normalizedOrderBys) {
-            if (isset($normalizedOrderBys[$sort])) {
-                if (strtolower($normalizedOrderBys[$sort]) === 'asc') {
-                    $val = 'glyphicon-arrow-up';
-                } else {
-                    $val = 'glyphicon-arrow-down';
-                }
-            } else {
-                $val = '';
-            }
-
-            return $val;
-        };
-
-        $makeDefaultHref = function ($sort) use ($req, $normalizedOrderBys) {
-            if (isset($normalizedOrderBys[$sort])) {
-                if (strtolower($normalizedOrderBys[$sort]) === 'asc') {
-                    $order = 'desc';
-                } else {
-                    $order = 'asc';
-                }
-            } else {
-                $order = 'desc';
-            }
-
-            $query = $req->query->get('search_query');
-            $query = $query['query'] ?? '';
-
-            return '?' . http_build_query(array(
-                'q' => $query,
-                'orderBys' => array(
-                    array(
-                        'sort' => $sort,
-                        'order' => $order
-                    )
-                )
-            ));
-        };
-
-        return array(
-            'downloads' => array(
-                'title' => 'Sort by downloads',
-                'class' => 'glyphicon-arrow-down',
-                'arrowClass' => $makeDefaultArrow('downloads'),
-                'href' => $makeDefaultHref('downloads')
-            ),
-            'favers' => array(
-                'title' => 'Sort by favorites',
-                'class' => 'glyphicon-star',
-                'arrowClass' => $makeDefaultArrow('favers'),
-                'href' => $makeDefaultHref('favers')
-            ),
-        );
     }
 
     /**
