@@ -1,6 +1,6 @@
 {% macro listPackages(packages, paginate, showAutoUpdateWarning, meta) %}
     <ul class="packages list-unstyled">
-        {% for package in packages if package.replacementPackage|default('') != 'spam/spam' %}
+        {% for package in packages|filter(package => package.replacementPackage|default('') != 'spam/spam') %}
             {% if package.id is numeric %}
                 {% set packageUrl = path('view_package', { 'name' : package.name }) %}
             {% else %}
@@ -38,7 +38,7 @@
                         <div class="col-sm-3 col-lg-2">
                             {% if meta %}
                                 <p class="metadata">
-                                    <span class="metadata-block"><i class="glyphicon glyphicon-arrow-down"></i> {{ meta.downloads[package.id]|default(0)|number_format(0, '.', '&#8201;')|raw }}</span>
+                                    <span class="metadata-block"><i class="glyphicon glyphicon-download"></i> {{ meta.downloads[package.id]|default(0)|number_format(0, '.', '&#8201;')|raw }}</span>
                                     <span class="metadata-block"><i class="glyphicon glyphicon-star"></i> {{ meta.favers[package.id]|default(0)|number_format(0, '.', '&#8201;')|raw }}</span>
                                 </p>
                             {% endif %}

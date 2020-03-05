@@ -16,6 +16,7 @@ use Symfony\Bridge\Doctrine\RegistryInterface;
 use Packagist\WebBundle\Entity\Package;
 use Psr\Log\LoggerInterface;
 use Algolia\AlgoliaSearch\SearchClient;
+use Predis\Client;
 use Packagist\WebBundle\Service\GitHubUserMigrationWorker;
 
 /**
@@ -35,7 +36,7 @@ class PackageManager
     protected $githubWorker;
     protected $metadataDir;
 
-    public function __construct(RegistryInterface $doctrine, \Swift_Mailer $mailer, \Swift_Mailer $instantMailer, \Twig_Environment $twig, LoggerInterface $logger, array $options, ProviderManager $providerManager, SearchClient $algoliaClient, string $algoliaIndexName, GitHubUserMigrationWorker $githubWorker, string $metadataDir)
+    public function __construct(RegistryInterface $doctrine, \Swift_Mailer $mailer, \Swift_Mailer $instantMailer, \Twig_Environment $twig, LoggerInterface $logger, array $options, ProviderManager $providerManager, SearchClient $algoliaClient, string $algoliaIndexName, GitHubUserMigrationWorker $githubWorker, string $metadataDir, Client $redis)
     {
         $this->doctrine = $doctrine;
         $this->mailer = $mailer;
@@ -48,6 +49,7 @@ class PackageManager
         $this->algoliaIndexName  = $algoliaIndexName;
         $this->githubWorker  = $githubWorker;
         $this->metadataDir  = $metadataDir;
+        $this->redis = $redis;
     }
 
     public function deletePackage(Package $package)
@@ -84,6 +86,7 @@ class PackageManager
         }
 
         $this->providerManager->deletePackage($package);
+        $packageId = $package->getId();
         $packageName = $package->getName();
 
         $em->remove($package);
@@ -102,6 +105,12 @@ class PackageManager
         }
         if (file_exists($metadataV2Dev.'.gz')) {
             @unlink($metadataV2Dev.'.gz');
+        }
+
+        // delete redis stats
+        try {
+            $this->redis->del('views:'.$packageId);
+        } catch (\Predis\Connection\ConnectionException $e) {
         }
 
         // attempt search index cleanup
@@ -149,8 +158,13 @@ class PackageManager
             }
 
             $package->setUpdateFailureNotified(true);
-            $this->doctrine->getEntityManager()->flush();
         }
+
+        // make sure the package crawl time is updated so we avoid retrying failing packages more often than working ones
+        if (!$package->getCrawledAt() || $package->getCrawledAt() < new \DateTime()) {
+            $package->setCrawledAt(new \DateTime);
+        }
+        $this->doctrine->getEntityManager()->flush();
 
         return true;
     }

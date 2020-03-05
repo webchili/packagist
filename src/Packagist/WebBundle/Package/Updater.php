@@ -31,6 +31,7 @@ use Packagist\WebBundle\Entity\VersionRepository;
 use Packagist\WebBundle\Entity\SuggestLink;
 use Symfony\Bridge\Doctrine\RegistryInterface;
 use Doctrine\DBAL\Connection;
+use Packagist\WebBundle\Service\VersionCache;
 
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
@@ -92,7 +93,7 @@ class Updater
      * @param RepositoryInterface $repository the repository instance used to update from
      * @param int $flags a few of the constants of this class
      */
-    public function update(IOInterface $io, Config $config, Package $package, RepositoryInterface $repository, $flags = 0, array $existingVersions = null): Package
+    public function update(IOInterface $io, Config $config, Package $package, RepositoryInterface $repository, $flags = 0, array $existingVersions = null, VersionCache $versionCache = null): Package
     {
         $rfs = new RemoteFilesystem($io, $config);
 
@@ -105,8 +106,11 @@ class Updater
 
         if ($repository instanceof VcsRepository) {
             $cfg = $repository->getRepoConfig();
-            if (isset($cfg['url']) && preg_match('{\bgithub\.com\b}', $cfg['url'])) {
+            if (isset($cfg['url']) && preg_match('{\bgithub\.com\b}i', $cfg['url'])) {
                 foreach ($package->getMaintainers() as $maintainer) {
+                    if ($maintainer->getId() === 1) {
+                        continue;
+                    }
                     if (!($newGithubToken = $maintainer->getGithubToken())) {
                         continue;
                     }
@@ -117,8 +121,8 @@ class Updater
                     }
 
                     if (true !== $valid) {
-                        $context = stream_context_create(['http' => ['header' => 'User-agent: packagist-token-check']]);
-                        $rate = json_decode(@file_get_contents('https://api.github.com/rate_limit?access_token='.$newGithubToken, false, $context), true);
+                        $context = stream_context_create(['http' => ['header' => ['User-agent: packagist-token-check', 'Authorization: token '.$newGithubToken]]]);
+                        $rate = json_decode(@file_get_contents('https://api.github.com/rate_limit', false, $context), true);
                         // invalid/outdated token, wipe it so we don't try it again
                         if (!$rate && (strpos($http_response_header[0], '403') || strpos($http_response_header[0], '401'))) {
                             $maintainer->setGithubToken(null);
@@ -141,6 +145,13 @@ class Updater
             }
 
             $rootIdentifier = $repository->getDriver()->getRootIdentifier();
+        }
+
+        // always update the master branch / root identifier, as in case a package gets archived
+        // we want to mark it abandoned automatically, but there will not be a new commit to trigger
+        // an update
+        if ($rootIdentifier && $versionCache) {
+            $versionCache->clearVersion($rootIdentifier);
         }
 
         $versions = $repository->getPackages();
@@ -199,7 +210,7 @@ class Updater
             }
             $processedVersions[strtolower($version->getVersion())] = $version;
 
-            $result = $this->updateInformation($versionRepository, $package, $existingVersions, $version, $flags, $rootIdentifier);
+            $result = $this->updateInformation($io, $versionRepository, $package, $existingVersions, $version, $flags, $rootIdentifier);
             $lastUpdated = $result['updated'];
 
             if ($lastUpdated) {
@@ -258,7 +269,7 @@ class Updater
      *                    - version (normalized version from the composer package)
      *                    - object (Version instance if it was updated)
      */
-    private function updateInformation(VersionRepository $versionRepo, Package $package, array $existingVersions, PackageInterface $data, $flags, $rootIdentifier)
+    private function updateInformation(IOInterface $io, VersionRepository $versionRepo, Package $package, array $existingVersions, PackageInterface $data, $flags, $rootIdentifier)
     {
         $em = $this->doctrine->getManager();
         $version = new Version();
@@ -268,9 +279,22 @@ class Updater
         $existingVersion = $existingVersions[strtolower($normVersion)] ?? null;
         if ($existingVersion) {
             $source = $existingVersion['source'];
-            // update if the right flag is set, or the source reference has changed (re-tag or new commit on branch)
-            if ($source['reference'] !== $data->getSourceReference() || ($flags & self::UPDATE_EQUAL_REFS)) {
+            if (
+                // update if the source reference has changed (re-tag or new commit on branch)
+                $source['reference'] !== $data->getSourceReference()
+                // or if the right flag is set
+                || ($flags & self::UPDATE_EQUAL_REFS)
+                // or if the package must be marked abandoned from composer.json
+                || ($data->isAbandoned() && !$package->isAbandoned())
+            ) {
                 $version = $versionRepo->findOneById($existingVersion['id']);
+            } elseif ($existingVersion['needs_author_migration']) {
+                $version = $versionRepo->findOneById($existingVersion['id']);
+
+                $version->setAuthorJson($version->getAuthorData());
+                $version->getAuthors()->clear();
+
+                return ['updated' => true, 'id' => $version->getId(), 'version' => strtolower($normVersion), 'object' => $version];
             } else {
                 return ['updated' => false, 'id' => $existingVersion['id'], 'version' => strtolower($normVersion), 'object' => null];
             }
@@ -289,6 +313,13 @@ class Updater
         // update the package description only for the default branch
         if ($rootIdentifier === null || preg_replace('{dev-|(\.x)?-dev}', '', $version->getVersion()) === $rootIdentifier) {
             $package->setDescription($descr);
+            if ($data->isAbandoned() && !$package->isAbandoned()) {
+                $io->write('Marking package abandoned as per composer metadata from '.$version->getVersion());
+                $package->setAbandoned(true);
+                if ($data->getReplacementPackage()) {
+                    $package->setReplacementPackage($data->getReplacementPackage());
+                }
+            }
         }
 
         $version->setHomepage($data->getHomepage());
@@ -332,6 +363,7 @@ class Updater
         $version->setBinaries($data->getBinaries());
         $version->setIncludePaths($data->getIncludePaths());
         $version->setSupport($data->getSupport());
+        $version->setFunding($data->getFunding());
 
         if ($data->getKeywords()) {
             $keywords = array();
@@ -363,21 +395,19 @@ class Updater
             $version->getTags()->clear();
         }
 
-        $authorRepository = $this->doctrine->getRepository('PackagistWebBundle:Author');
-
         $version->getAuthors()->clear();
+        $version->setAuthorJson([]);
         if ($data->getAuthors()) {
+            $authors = [];
             foreach ($data->getAuthors() as $authorData) {
-                $author = null;
+                $author = [];
 
                 foreach (array('email', 'name', 'homepage', 'role') as $field) {
                     if (isset($authorData[$field])) {
-                        $authorData[$field] = trim($authorData[$field]);
-                        if ('' === $authorData[$field]) {
-                            $authorData[$field] = null;
+                        $author[$field] = trim($authorData[$field]);
+                        if ('' === $author[$field]) {
+                            unset($author[$field]);
                         }
-                    } else {
-                        $authorData[$field] = null;
                     }
                 }
 
@@ -386,32 +416,9 @@ class Updater
                     continue;
                 }
 
-                $author = $authorRepository->findOneBy(array(
-                    'email' => $authorData['email'],
-                    'name' => $authorData['name'],
-                    'homepage' => $authorData['homepage'],
-                    'role' => $authorData['role'],
-                ));
-
-                if (!$author) {
-                    $author = new Author();
-                    $em->persist($author);
-                }
-
-                foreach (array('email', 'name', 'homepage', 'role') as $field) {
-                    if (isset($authorData[$field])) {
-                        $author->{'set'.$field}($authorData[$field]);
-                    }
-                }
-
-                // only update the author timestamp once a month at most as the value is kinda unused
-                if ($author->getUpdatedAt() === null || $author->getUpdatedAt()->getTimestamp() < time() - 86400 * 30) {
-                    $author->setUpdatedAt(new \DateTime);
-                }
-                if (!$version->getAuthors()->contains($author)) {
-                    $version->addAuthor($author);
-                }
+                $authors[] = $author;
             }
+            $version->setAuthorJson($authors);
         }
 
         // handle links

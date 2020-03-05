@@ -13,7 +13,9 @@
 namespace Packagist\WebBundle\Controller;
 
 use Packagist\WebBundle\Entity\Package;
+use Packagist\WebBundle\Entity\SecurityAdvisory;
 use Packagist\WebBundle\Entity\User;
+use Packagist\WebBundle\Util\UserAgentParser;
 use Sensio\Bundle\FrameworkExtraBundle\Configuration\ParamConverter;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -102,21 +104,25 @@ class ApiController extends Controller
         if (isset($payload['project']['git_http_url'])) { // gitlab event payload
             $urlRegex = '{^(?:ssh://git@|https?://|git://|git@)?(?P<host>[a-z0-9.-]+)(?::[0-9]+/|[:/])(?P<path>[\w.-]+(?:/[\w.-]+?)+)(?:\.git|/)?$}i';
             $url = $payload['project']['git_http_url'];
+            $remoteId = null;
         } elseif (isset($payload['repository']['url'])) { // github/anything hook
             $urlRegex = '{^(?:ssh://git@|https?://|git://|git@)?(?P<host>[a-z0-9.-]+)(?::[0-9]+/|[:/])(?P<path>[\w.-]+(?:/[\w.-]+?)*)(?:\.git|/)?$}i';
             $url = $payload['repository']['url'];
             $url = str_replace('https://api.github.com/repos', 'https://github.com', $url);
+            $remoteId = $payload['repository']['id'] ?? null;
         } elseif (isset($payload['repository']['links']['html']['href'])) { // bitbucket push event payload
             $urlRegex = '{^(?:https?://|git://|git@)?(?:api\.)?(?P<host>bitbucket\.org)[/:](?P<path>[\w.-]+/[\w.-]+?)(\.git)?/?$}i';
             $url = $payload['repository']['links']['html']['href'];
+            $remoteId = null;
         } elseif (isset($payload['canon_url']) && isset($payload['repository']['absolute_url'])) { // bitbucket post hook (deprecated)
             $urlRegex = '{^(?:https?://|git://|git@)?(?P<host>bitbucket\.org)[/:](?P<path>[\w.-]+/[\w.-]+?)(\.git)?/?$}i';
             $url = $payload['canon_url'].$payload['repository']['absolute_url'];
+            $remoteId = null;
         } else {
             return new JsonResponse(array('status' => 'error', 'message' => 'Missing or invalid payload'), 406);
         }
 
-        return $this->receivePost($request, $url, $urlRegex);
+        return $this->receivePost($request, $url, $urlRegex, $remoteId);
     }
 
     /**
@@ -142,7 +148,8 @@ class ApiController extends Controller
         }
 
         $package->setRepository($payload['repository']);
-        $errors = $this->get('validator')->validate($package, array("Update"));
+
+        $errors = $this->get('validator')->validate($package, null, array("Update"));
         if (count($errors) > 0) {
             $errorArray = array();
             foreach ($errors as $error) {
@@ -226,6 +233,15 @@ class ApiController extends Controller
 
         if ($jobs) {
             $this->get('packagist.download_manager')->addDownloads($jobs);
+
+            $uaParser = new UserAgentParser($request->headers->get('User-Agent'));
+            $this->get('Graze\DogStatsD\Client')->increment('installs', 1, 1, [
+                'composer' => $uaParser->getComposerVersion() ?: 'unknown',
+                'php_minor' => preg_replace('{^(\d+\.\d+).*}', '$1', $uaParser->getPhpVersion()) ?: 'unknown',
+                'php_patch' => $uaParser->getPhpVersion() ?: 'unknown',
+                'http' => $uaParser->getHttpVersion() ?: 'unknown',
+                'ci' => $uaParser->getCI() ? 'true' : 'false',
+            ]);
         }
 
         if ($failed) {
@@ -233,6 +249,34 @@ class ApiController extends Controller
         }
 
         return new JsonResponse(array('status' => 'success'), 201);
+    }
+
+    /**
+     * @Route(
+     *     "/api/security-advisories/",
+     *     name="api_security_adivosries",
+     *     defaults={"_format" = "json"},
+     *     methods={"GET", "POST"}
+     * )
+     */
+    public function securityAdvisoryAction(Request $request): JsonResponse
+    {
+        $packageNames = array_filter((array) $request->get('packages'));
+        if ((!$request->query->has('updatedSince') && !$request->get('packages')) || (!$packageNames && $request->get('packages'))) {
+            return new JsonResponse(['status' => 'error', 'message' => 'Missing array of package names as the "packages" parameter'], 400);
+        }
+
+        $updatedSince = $request->query->getInt('updatedSince', 0);
+
+        /** @var array[] $advisories */
+        $advisories = $this->getDoctrine()->getRepository(SecurityAdvisory::class)->searchSecurityAdvisories($packageNames, $updatedSince);
+
+        $response = ['advisories' => []];
+        foreach ($advisories as $advisory) {
+            $response['advisories'][$advisory['packageName']][] = $advisory;
+        }
+
+        return new JsonResponse($response, 200);
     }
 
     /**
@@ -261,11 +305,15 @@ class ApiController extends Controller
      * @param string $urlRegex the regex used to split the user packages into domain and path
      * @return Response
      */
-    protected function receivePost(Request $request, $url, $urlRegex)
+    protected function receivePost(Request $request, $url, $urlRegex, $remoteId)
     {
         // try to parse the URL first to avoid the DB lookup on malformed requests
         if (!preg_match($urlRegex, $url, $match)) {
             return new Response(json_encode(array('status' => 'error', 'message' => 'Could not parse payload repository URL')), 406);
+        }
+
+        if ($remoteId) {
+            $remoteId = $match['host'].'/'.$remoteId;
         }
 
         $packages = null;
@@ -277,12 +325,12 @@ class ApiController extends Controller
         if ($match['host'] === 'github.com' && $request->getContent() && $request->query->has('username') && $request->headers->has('X-Hub-Signature')) {
             $username = $request->query->get('username');
             $sig = $request->headers->get('X-Hub-Signature');
-            $user = $this->get('packagist.user_repository')->findOneByUsername($username);
+            $user = $this->getDoctrine()->getRepository(User::class)->findOneByUsername($username);
             if ($sig && $user && $user->isEnabled()) {
                 list($algo, $sig) = explode('=', $sig);
                 $expected = hash_hmac($algo, $request->getContent(), $user->getApiToken());
                 if (hash_equals($expected, $sig)) {
-                    $packages = $this->findPackagesByRepository('https://github.com/'.$match['path']);
+                    $packages = $this->findPackagesByRepository('https://github.com/'.$match['path'], $remoteId, $user);
                     $autoUpdated = Package::AUTO_GITHUB_HOOK;
                     $receiveType = 'github_user_secret';
                 } else {
@@ -304,7 +352,7 @@ class ApiController extends Controller
                 list($algo, $sig) = explode('=', $sig);
                 $expected = hash_hmac($algo, $request->getContent(), $this->container->getParameter('github.webhook_secret'));
                 if (hash_equals($expected, $sig)) {
-                    $packages = $this->findPackagesByRepository('https://github.com/'.$match['path']);
+                    $packages = $this->findPackagesByRepository('https://github.com/'.$match['path'], $remoteId);
                     $autoUpdated = Package::AUTO_GITHUB_HOOK;
                     $receiveType = 'github_auto';
                 }
@@ -317,7 +365,7 @@ class ApiController extends Controller
             }
 
             // try to find the user package
-            $packages = $this->findPackagesByUrl($user, $url, $urlRegex);
+            $packages = $this->findPackagesByUrl($user, $url, $urlRegex, $remoteId);
         }
 
         if (!$packages) {
@@ -330,11 +378,12 @@ class ApiController extends Controller
         /** @var Package $package */
         foreach ($packages as $package) {
             $package->setAutoUpdated($autoUpdated);
-            $em->flush($package);
 
             $job = $this->get('scheduler')->scheduleUpdate($package);
             $jobs[] = $job->getId();
         }
+
+        $em->flush();
 
         return new JsonResponse(['status' => 'success', 'jobs' => $jobs, 'type' => $receiveType], 202);
     }
@@ -359,7 +408,7 @@ class ApiController extends Controller
             return null;
         }
 
-        $user = $this->get('packagist.user_repository')
+        $user = $this->getDoctrine()->getRepository(User::class)
             ->findOneBy(array('username' => $username, 'apiToken' => $apiToken));
 
         if ($user && !$user->isEnabled()) {
@@ -377,7 +426,7 @@ class ApiController extends Controller
      * @param string $urlRegex
      * @return array the packages found
      */
-    protected function findPackagesByUrl(User $user, $url, $urlRegex)
+    protected function findPackagesByUrl(User $user, $url, $urlRegex, $remoteId)
     {
         if (!preg_match($urlRegex, $url, $matched)) {
             return array();
@@ -394,6 +443,9 @@ class ApiController extends Controller
                 )
             ) {
                 $packages[] = $package;
+                if ($remoteId && !$package->getRemoteId()) {
+                    $package->setRemoteId($remoteId);
+                }
             }
         }
 
@@ -404,8 +456,37 @@ class ApiController extends Controller
      * @param string $url
      * @return array the packages found
      */
-    protected function findPackagesByRepository(string $url): array
+    protected function findPackagesByRepository(string $url, $remoteId, User $user = null): array
     {
-        return $this->getDoctrine()->getRepository(Package::class)->findBy(['repository' => $url]);
+        $packageRepo = $this->getDoctrine()->getRepository(Package::class);
+        $packages = $packageRepo->findBy(['repository' => $url]);
+        $updateUrl = false;
+
+        // maybe url changed, look up by remoteId
+        if (!$packages) {
+            $packages = $packageRepo->findBy(['remoteId' => $remoteId]);
+            $updateUrl = true;
+        }
+
+        if ($user) {
+            // need to check ownership if a user is provided as we can not trust that the request came from github in this case
+            $packages = array_filter($packages, function ($p) use ($user, $packageRepo) {
+                return $packageRepo->isPackageMaintainedBy($p, $user->getId());
+            });
+        }
+
+        foreach ($packages as $package) {
+            if ($remoteId && !$package->getRemoteId()) {
+                $package->setRemoteId($remoteId);
+            }
+        }
+
+        if ($updateUrl) {
+            foreach ($packages as $package) {
+                $package->setRepository($url);
+            }
+        }
+
+        return $packages;
     }
 }

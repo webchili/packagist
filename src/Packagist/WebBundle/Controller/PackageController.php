@@ -3,12 +3,16 @@
 namespace Packagist\WebBundle\Controller;
 
 use Composer\Package\Version\VersionParser;
+use Composer\Semver\Constraint\Constraint;
 use DateTimeImmutable;
 use Doctrine\ORM\NoResultException;
 use Packagist\WebBundle\Entity\Download;
 use Packagist\WebBundle\Entity\Package;
 use Packagist\WebBundle\Entity\PackageRepository;
+use Packagist\WebBundle\Entity\SecurityAdvisory;
+use Packagist\WebBundle\Entity\SecurityAdvisoryRepository;
 use Packagist\WebBundle\Entity\Version;
+use Packagist\WebBundle\Entity\Vendor;
 use Packagist\WebBundle\Entity\VersionRepository;
 use Packagist\WebBundle\Form\Model\MaintainerRequest;
 use Packagist\WebBundle\Form\Type\AbandonedType;
@@ -77,9 +81,11 @@ class PackageController extends Controller
      */
     public function updatedSinceAction(Request $req)
     {
+        $lastDumpTime = $this->get('snc_redis.default_client')->get('last_metadata_dump_time') ?: (time() - 60);
+
         $since = $req->query->get('since');
         if (!$since) {
-            return new JsonResponse(['error' => 'Missing "since" query parameter with the latest timestamp you got from this endpoint'], 400);
+            return new JsonResponse(['error' => 'Missing "since" query parameter with the latest timestamp you got from this endpoint', 'timestamp' => $lastDumpTime], 400);
         }
 
         try {
@@ -92,8 +98,6 @@ class PackageController extends Controller
         $repo = $this->getDoctrine()->getRepository(Package::class);
 
         $names = $repo->getPackageNamesUpdatedSince($since);
-
-        $lastDumpTime = $this->get('snc_redis.default_client')->get('last_metadata_dump_time') ?: (time() - 60);
 
         return new JsonResponse(['packageNames' => $names, 'timestamp' => $lastDumpTime]);
     }
@@ -255,19 +259,23 @@ class PackageController extends Controller
 
     /**
      * @Route(
-     *     "/providers/{name}",
+     *     "/providers/{name}.{_format}",
      *     name="view_providers",
-     *     requirements={"name"="[A-Za-z0-9/_.-]+?"},
+     *     requirements={"name"="[A-Za-z0-9/_.-]+?", "_format"="(json)"},
      *     defaults={"_format"="html"},
      *     methods={"GET"}
      * )
      */
-    public function viewProvidersAction($name)
+    public function viewProvidersAction(Request $req, $name)
     {
         /** @var PackageRepository $repo */
         $repo = $this->getDoctrine()->getRepository(Package::class);
         $providers = $repo->findProviders($name);
         if (!$providers) {
+            if ($req->getRequestFormat() === 'json') {
+                return new JsonResponse(['providers' => []]);
+            }
+
             return $this->redirect($this->generateUrl('search', array('q' => $name, 'reason' => 'package_not_found')));
         }
 
@@ -291,12 +299,87 @@ class PackageController extends Controller
             });
         } catch (ConnectionException $e) {}
 
+        if ($req->getRequestFormat() === 'json') {
+            foreach ($providers as $index => $package) {
+                $providers[$index] = [
+                    'name' => $package->getName(),
+                    'description' => $package->getDescription(),
+                    'type' => $package->getType(),
+                    'repository' => $package->getRepository(),
+                ];
+            }
+
+            return new JsonResponse(['providers' => $providers]);
+        }
+
         return $this->render('PackagistWebBundle:package:providers.html.twig', array(
             'name' => $name,
             'packages' => $providers,
             'meta' => $this->getPackagesMetadata($providers),
             'paginate' => false,
         ));
+    }
+
+    /**
+     * @Route(
+     *     "/spam",
+     *     name="view_spam",
+     *     defaults={"_format"="html"},
+     *     methods={"GET"}
+     * )
+     */
+    public function viewSpamAction(Request $req)
+    {
+        if (!$this->getUser() || !$this->isGranted('ROLE_ANTISPAM')) {
+            throw new NotFoundHttpException();
+        }
+
+        $page = max(1, (int) $req->query->get('page', 1));
+
+        /** @var PackageRepository $repo */
+        $repo = $this->getDoctrine()->getRepository(Package::class);
+        $count = $repo->getSuspectPackageCount();
+        $packages = $repo->getSuspectPackages(($page - 1) * 50, 50);
+
+        $paginator = new Pagerfanta(new FixedAdapter($count, $packages));
+        $paginator->setMaxPerPage(50);
+        $paginator->setCurrentPage($page, false, true);
+
+        $data['packages'] = $paginator;
+        $data['count'] = $count;
+        $data['meta'] = $this->getPackagesMetadata($data['packages']);
+        $data['markSafeCsrfToken'] = $this->get('security.csrf.token_manager')->getToken('mark_safe');
+
+        return $this->render('PackagistWebBundle:package:spam.html.twig', $data);
+    }
+
+    /**
+     * @Route(
+     *     "/spam/nospam",
+     *     name="mark_nospam",
+     *     defaults={"_format"="html"},
+     *     methods={"POST"}
+     * )
+     */
+    public function markSafeAction(Request $req)
+    {
+        if (!$this->getUser() || !$this->isGranted('ROLE_ANTISPAM')) {
+            throw new NotFoundHttpException();
+        }
+
+        $expectedToken = $this->get('security.csrf.token_manager')->getToken('mark_safe')->getValue();
+
+        $vendors = array_filter((array) $req->request->get('vendor'));
+        if (!hash_equals($expectedToken, $req->request->get('token'))) {
+            throw new BadRequestHttpException('Invalid CSRF token');
+        }
+
+        $repo = $this->getDoctrine()->getRepository(Vendor::class);
+        foreach ($vendors as $vendor) {
+            $repo->verify($vendor);
+        }
+
+        return $this->redirectToRoute('view_spam');
     }
 
     /**
@@ -342,8 +425,8 @@ class PackageController extends Controller
         }
 
         if ('json' === $req->getRequestFormat()) {
-            $data = $package->toArray($this->getDoctrine()->getRepository(Version::class));
-            $data['dependents'] = $repo->getDependentCount($package->getName());
+            $data = $package->toArray($this->getDoctrine()->getRepository(Version::class), true);
+            $data['dependents'] = $repo->getDependantCount($package->getName());
             $data['suggesters'] = $repo->getSuggestCount($package->getName());
 
             try {
@@ -399,7 +482,19 @@ class PackageController extends Controller
         );
 
         try {
-            $data['downloads'] = $this->get('packagist.download_manager')->getDownloads($package);
+            $data['downloads'] = $this->get('packagist.download_manager')->getDownloads($package, null, true);
+
+            if (
+                !$package->isSuspect()
+                && ($data['downloads']['total'] ?? 0) <= 10 && ($data['downloads']['views'] ?? 0) >= 100
+                && $package->getCreatedAt()->getTimestamp() >= strtotime('2019-05-01')
+            ) {
+                $vendorRepo = $this->getDoctrine()->getRepository(Vendor::class);
+                if (!$vendorRepo->isVerified($package->getVendor())) {
+                    $package->setSuspect('Too many views');
+                    $repo->markPackageSuspect($package);
+                }
+            }
 
             if ($this->getUser()) {
                 $data['is_favorite'] = $this->get('packagist.favorite_manager')->isMarked($this->getUser(), $package);
@@ -407,8 +502,23 @@ class PackageController extends Controller
         } catch (ConnectionException $e) {
         }
 
-        $data['dependents'] = $repo->getDependentCount($package->getName());
+        $data['dependents'] = $repo->getDependantCount($package->getName());
         $data['suggesters'] = $repo->getSuggestCount($package->getName());
+
+        /** @var SecurityAdvisoryRepository $securityAdvisoryRepository */
+        $securityAdvisoryRepository = $this->getDoctrine()->getRepository(SecurityAdvisory::class);
+        $securityAdvisories = $securityAdvisoryRepository->getPackageSecurityAdvisories($package->getName());
+        $data['securityAdvisories'] = count($securityAdvisories);
+        $data['hasVersionSecurityAdvisories'] = [];
+        foreach ($securityAdvisories as $advisory) {
+            $versionParser = new VersionParser();
+            $affectedVersionConstraint = $versionParser->parseConstraints($advisory['affectedVersions']);
+            foreach ($versions as $version) {
+                if (!isset($data['hasVersionSecurityAdvisories'][$version->getId()]) && $affectedVersionConstraint->matches(new Constraint('=', $version->getNormalizedVersion()))) {
+                    $data['hasVersionSecurityAdvisories'][$version->getId()] = true;
+                }
+            }
+        }
 
         if ($maintainerForm = $this->createAddMaintainerForm($package)) {
             $data['addMaintainerForm'] = $maintainerForm->createView();
@@ -424,6 +534,9 @@ class PackageController extends Controller
                 || $package->getMaintainers()->contains($this->getUser())
             )) {
             $data['deleteVersionCsrfToken'] = $this->get('security.csrf.token_manager')->getToken('delete_version');
+        }
+        if ($this->isGranted('ROLE_ANTISPAM')) {
+            $data['markSafeCsrfToken'] = $this->get('security.csrf.token_manager')->getToken('mark_safe');
         }
 
         return $data;
@@ -581,7 +694,14 @@ class PackageController extends Controller
             return new JsonResponse(['status' => 'error', 'message' => 'Invalid credentials'], 403);
         }
 
-        if ($package->getMaintainers()->contains($user) || $this->isGranted('ROLE_UPDATE_PACKAGES')) {
+        $canUpdatePackage = $package->getMaintainers()->contains($user) || $this->isGranted('ROLE_UPDATE_PACKAGES');
+        if ($canUpdatePackage || !$package->wasUpdatedInTheLast24Hours()) {
+            // do not let non-maintainers execute update with those flags
+            if (!$canUpdatePackage) {
+                $autoUpdated = null;
+                $updateEqualRefs = false;
+            }
+
             if (null !== $autoUpdated) {
                 $package->setAutoUpdated($autoUpdated ? Package::AUTO_MANUAL_HOOK : 0);
                 $doctrine->getManager()->flush();
@@ -594,6 +714,10 @@ class PackageController extends Controller
             }
 
             return new JsonResponse(['status' => 'success'], 202);
+        }
+
+        if (!$canUpdatePackage && $package->wasUpdatedInTheLast24Hours()) {
+            return new JsonResponse(['status' => 'error', 'message' => 'Package was already updated in the last 24 hours',], 404);
         }
 
         return new JsonResponse(array('status' => 'error', 'message' => 'Could not find a package that matches this request (does user maintain the package?)',), 404);
@@ -807,6 +931,7 @@ class PackageController extends Controller
             $package->setIndexedAt(null);
             $package->setCrawledAt(new \DateTime());
             $package->setUpdatedAt(new \DateTime());
+            $package->setDumpedAt(null);
 
             $em = $this->getDoctrine()->getManager();
             $em->flush();
@@ -838,6 +963,7 @@ class PackageController extends Controller
         $package->setIndexedAt(null);
         $package->setCrawledAt(new \DateTime());
         $package->setUpdatedAt(new \DateTime());
+        $package->setDumpedAt(null);
 
         $em = $this->getDoctrine()->getManager();
         $em->flush();
@@ -856,6 +982,7 @@ class PackageController extends Controller
      */
     public function statsAction(Request $req, Package $package)
     {
+        /** @var Version[] $versions */
         $versions = $package->getVersions()->toArray();
         usort($versions, Package::class.'::sortVersions');
         $date = $this->guessStatsStartDate($package);
@@ -878,66 +1005,121 @@ class PackageController extends Controller
         $data['package'] = $package;
 
         $expandedVersion = reset($versions);
+        $majorVersions = [];
+        $foundExpandedVersion = false;
         foreach ($versions as $v) {
-            /** @var Version $v */
             if (!$v->isDevelopment()) {
-                $expandedVersion = $v;
-                break;
+                $majorVersions[] = $v->getMajorVersion();
+                if (!$foundExpandedVersion) {
+                    $expandedVersion = $v;
+                    $foundExpandedVersion = true;
+                }
             }
         }
-        $data['expandedId'] = $expandedVersion ? $expandedVersion->getId() : false;
+        $data['majorVersions'] = $majorVersions ? array_merge(['all'], array_unique($majorVersions)) : [];
+        $data['expandedId'] = $majorVersions ? 'major/all' : ($expandedVersion ? $expandedVersion->getId() : false);
 
         return $data;
     }
 
     /**
      * @Route(
-     *      "/packages/{name}/dependents",
+     *      "/packages/{name}/dependents.{_format}",
      *      name="view_package_dependents",
-     *      requirements={"name"="([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?|ext-[A-Za-z0-9_.-]+?)"}
+     *      requirements={"name"="([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?|ext-[A-Za-z0-9_.-]+?)"},
+     *      defaults={"_format"="html"}
      * )
      */
     public function dependentsAction(Request $req, $name)
     {
-        $page = $req->query->get('page', 1);
+        $page = max(1, (int) $req->query->get('page', 1));
+        $perPage = 15;
+        $orderBy = $req->query->get('order_by', 'name');
+
+        if ($req->getRequestFormat() === 'json') {
+            $perPage = 100;
+        }
 
         /** @var PackageRepository $repo */
         $repo = $this->getDoctrine()->getRepository(Package::class);
-        $depCount = $repo->getDependentCount($name);
-        $packages = $repo->getDependents($name, ($page - 1) * 15, 15);
+        $depCount = $repo->getDependantCount($name);
+        $packages = $repo->getDependents($name, ($page - 1) * $perPage, $perPage, $orderBy);
 
         $paginator = new Pagerfanta(new FixedAdapter($depCount, $packages));
-        $paginator->setMaxPerPage(15);
+        $paginator->setMaxPerPage($perPage);
         $paginator->setCurrentPage($page, false, true);
+
+        if ($req->getRequestFormat() === 'json') {
+            $data = [
+                'packages' => $paginator->getCurrentPageResults(),
+            ];
+            $meta = $this->getPackagesMetadata($data['packages']);
+            foreach ($data['packages'] as $index => $package) {
+                $data['packages'][$index]['downloads'] = $meta['downloads'][$package['id']];
+                $data['packages'][$index]['favers'] = $meta['favers'][$package['id']];
+            }
+
+            if ($paginator->hasNextPage()) {
+                $data['next'] = $this->generateUrl('view_package_dependents', ['name' => $name, 'page' => $page + 1, '_format' => 'json', 'order_by' => $orderBy], UrlGeneratorInterface::ABSOLUTE_URL);
+            }
+            $data['ordered_by_name'] = $this->generateUrl('view_package_dependents', ['name' => $name, '_format' => 'json', 'order_by' => 'name'], UrlGeneratorInterface::ABSOLUTE_URL);
+            $data['ordered_by_downloads'] = $this->generateUrl('view_package_dependents', ['name' => $name, '_format' => 'json', 'order_by' => 'downloads'], UrlGeneratorInterface::ABSOLUTE_URL);
+
+            return new JsonResponse($data);
+        }
 
         $data['packages'] = $paginator;
         $data['count'] = $depCount;
 
         $data['meta'] = $this->getPackagesMetadata($data['packages']);
         $data['name'] = $name;
+        $data['order_by'] = $orderBy;
 
         return $this->render('PackagistWebBundle:package:dependents.html.twig', $data);
     }
 
     /**
      * @Route(
-     *      "/packages/{name}/suggesters",
+     *      "/packages/{name}/suggesters.{_format}",
      *      name="view_package_suggesters",
-     *      requirements={"name"="([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?|ext-[A-Za-z0-9_.-]+?)"}
+     *      requirements={"name"="([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?|ext-[A-Za-z0-9_.-]+?)"},
+     *      defaults={"_format"="html"}
      * )
      */
     public function suggestersAction(Request $req, $name)
     {
-        $page = $req->query->get('page', 1);
+        $page = max(1, (int) $req->query->get('page', 1));
+        $perPage = 15;
+
+        if ($req->getRequestFormat() === 'json') {
+            $perPage = 100;
+        }
 
         /** @var PackageRepository $repo */
         $repo = $this->getDoctrine()->getRepository(Package::class);
         $suggestCount = $repo->getSuggestCount($name);
-        $packages = $repo->getSuggests($name, ($page - 1) * 15, 15);
+        $packages = $repo->getSuggests($name, ($page - 1) * $perPage, $perPage);
 
         $paginator = new Pagerfanta(new FixedAdapter($suggestCount, $packages));
-        $paginator->setMaxPerPage(15);
+        $paginator->setMaxPerPage($perPage);
         $paginator->setCurrentPage($page, false, true);
+
+        if ($req->getRequestFormat() === 'json') {
+            $data = [
+                'packages' => $paginator->getCurrentPageResults(),
+            ];
+            $meta = $this->getPackagesMetadata($data['packages']);
+            foreach ($data['packages'] as $index => $package) {
+                $data['packages'][$index]['downloads'] = $meta['downloads'][$package['id']];
+                $data['packages'][$index]['favers'] = $meta['favers'][$package['id']];
+            }
+
+            if ($paginator->hasNextPage()) {
+                $data['next'] = $this->generateUrl('view_package_suggesters', ['name' => $name, 'page' => $page + 1, '_format' => 'json'], UrlGeneratorInterface::ABSOLUTE_URL);
+            }
+
+            return new JsonResponse($data);
+        }
 
         $data['packages'] = $paginator;
         $data['count'] = $suggestCount;
@@ -956,7 +1138,7 @@ class PackageController extends Controller
      * )
      * @ParamConverter("version", options={"exclude": {"name"}})
      */
-    public function overallStatsAction(Request $req, Package $package, Version $version = null)
+    public function overallStatsAction(Request $req, Package $package, Version $version = null, $majorVersion = null)
     {
         if ($from = $req->query->get('from')) {
             $from = new DateTimeImmutable($from);
@@ -970,50 +1152,67 @@ class PackageController extends Controller
         }
         $average = $req->query->get('average', $this->guessStatsAverage($from, $to));
 
-        if ($version) {
+        $dlData = [];
+        if ($majorVersion) {
+            if ($majorVersion === 'all') {
+                $dlData = $this->getDoctrine()->getRepository('PackagistWebBundle:Download')->findDataByMajorVersions($package);
+            } else {
+                if (!is_numeric($majorVersion)) {
+                    throw new BadRequestHttpException('Major version should be an int or "all"');
+                }
+                $dlData = $this->getDoctrine()->getRepository('PackagistWebBundle:Download')->findDataByMajorVersion($package, (int) $majorVersion);
+            }
+        } elseif ($version) {
             $downloads = $this->getDoctrine()->getRepository('PackagistWebBundle:Download')->findOneBy(['id' => $version->getId(), 'type' => Download::TYPE_VERSION]);
+            $dlData[$version->getVersion()] = [$downloads ? $downloads->getData() : []];
         } else {
             $downloads = $this->getDoctrine()->getRepository('PackagistWebBundle:Download')->findOneBy(['id' => $package->getId(), 'type' => Download::TYPE_PACKAGE]);
+            $dlData[$package->getName()] = [$downloads ? $downloads->getData() : []];
         }
 
         $datePoints = $this->createDatePoints($from, $to, $average);
-        $dlData = $downloads ? $downloads->getData() : [];
+        $series = [];
 
         foreach ($datePoints as $label => $values) {
-            $value = 0;
-            foreach ($values as $valueKey) {
-                $value += $dlData[$valueKey] ?? 0;
+            foreach ($dlData as $seriesName => $seriesData) {
+                $value = 0;
+                foreach ($values as $valueKey) {
+                    foreach ($seriesData as $data) {
+                        $value += $data[$valueKey] ?? 0;
+                    }
+                }
+                $series[$seriesName][] = ceil($value / count($values));
             }
-            $datePoints[$label] = $value;
         }
 
         $datePoints = array(
             'labels' => array_keys($datePoints),
-            'values' => array_values($datePoints),
+            'values' => $series,
         );
 
         $datePoints['average'] = $average;
 
-        if ($average !== 'daily') {
-            $dividers = [
-                'monthly' => 30.41,
-                'weekly' => 7,
-            ];
-            $divider = $dividers[$average];
-            $datePoints['values'] = array_map(function ($val) use ($divider) {
-                return ceil($val / $divider);
-            }, $datePoints['values']);
-        }
-
         if (empty($datePoints['labels']) && empty($datePoints['values'])) {
             $datePoints['labels'][] = date('Y-m-d');
-            $datePoints['values'][] = 0;
+            $datePoints['values'][] = [0];
         }
 
         $response = new JsonResponse($datePoints);
         $response->setSharedMaxAge(1800);
 
         return $response;
+    }
+
+    /**
+     * @Route(
+     *      "/packages/{name}/stats/major/{majorVersion}.json",
+     *      name="major_version_stats",
+     *      requirements={"name"="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?", "majorVersion"="(all|[0-9]+?)"}
+     * )
+     */
+    public function majorVersionStatsAction(Request $req, Package $package, $majorVersion)
+    {
+        return $this->overallStatsAction($req, $package, null, $majorVersion);
     }
 
     /**
@@ -1038,6 +1237,49 @@ class PackageController extends Controller
         }
 
         return $this->overallStatsAction($req, $package, $version);
+    }
+
+    /**
+     * @Route(
+     *      "/packages/{name}/advisories",
+     *      name="view_package_advisories",
+     *      requirements={"name"="([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?|ext-[A-Za-z0-9_.-]+?)"}
+     * )
+     */
+    public function securityAdvisoriesAction(Request $request, $name)
+    {
+        /** @var SecurityAdvisoryRepository $repo */
+        $repo = $this->getDoctrine()->getRepository(SecurityAdvisory::class);
+        $securityAdvisories = $repo->getPackageSecurityAdvisories($name);
+
+        $data = [];
+        $data['name'] = $name;
+
+        $data['matchingAdvisories'] = [];
+        if ($versionId = $request->query->getInt('version')) {
+            $version = $this->getDoctrine()->getRepository(Version::class)->findOneBy([
+                'name' => $name,
+                'id' => $versionId,
+            ]);
+            if ($version) {
+                $versionSecurityAdvisories = [];
+                $versionParser = new VersionParser();
+                foreach ($securityAdvisories as $advisory) {
+                    $affectedVersionConstraint = $versionParser->parseConstraints($advisory['affectedVersions']);
+                    if ($affectedVersionConstraint->matches(new Constraint('=', $version->getNormalizedVersion()))) {
+                        $versionSecurityAdvisories[] = $advisory;
+                    }
+                }
+
+                $data['version'] = $version->getVersion();
+                $securityAdvisories = $versionSecurityAdvisories;
+            }
+        }
+
+        $data['securityAdvisories'] = $securityAdvisories;
+        $data['count'] = count($securityAdvisories);
+
+        return $this->render('PackagistWebBundle:package:security_advisories.html.twig', $data);
     }
 
     private function createAddMaintainerForm(Package $package)
@@ -1101,13 +1343,15 @@ class PackageController extends Controller
         $dateKey = 'Ymd';
         $dateFormat = $average === 'monthly' ? 'Y-m' : 'Y-m-d';
         $dateJump = '+1day';
-        if ($average === 'monthly') {
-            $from = new DateTimeImmutable('first day of ' . $from->format('Y-m'));
-            $to = new DateTimeImmutable('last day of ' . $to->format('Y-m'));
-        }
 
         $nextDataPointLabel = $from->format($dateFormat);
-        $nextDataPoint = $from->modify($interval);
+
+        if ($average === 'monthly') {
+            $nextDataPoint = new DateTimeImmutable('first day of ' . $from->format('Y-m'));
+            $nextDataPoint = $nextDataPoint->modify($interval);
+        } else {
+            $nextDataPoint = $from->modify($interval);
+        }
 
         $datePoints = [];
         while ($from <= $to) {

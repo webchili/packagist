@@ -2,6 +2,7 @@
 
 namespace Packagist\WebBundle\Service;
 
+use Packagist\WebBundle\SecurityAdvisory\FriendsOfPhpSecurityAdvisoriesSource;
 use Packagist\WebBundle\Service\Scheduler;
 use Psr\Log\LoggerInterface;
 use Composer\Package\Loader\ArrayLoader;
@@ -71,10 +72,11 @@ class UpdaterWorker
         }
 
         $packageName = $package->getName();
+        $packageVendor = $package->getVendor();
 
         $lockAcquired = $this->locker->lockPackageUpdate($id);
         if (!$lockAcquired) {
-            return ['status' => Job::STATUS_RESCHEDULE, 'after' => new \DateTime('+5 seconds')];
+            return ['status' => Job::STATUS_RESCHEDULE, 'after' => new \DateTime('+5 seconds'), 'vendor' => $packageVendor];
         }
 
         $this->logger->info('Updating '.$packageName);
@@ -127,7 +129,7 @@ class UpdaterWorker
             $repository->setLoader($loader);
 
             // perform the actual update (fetch and re-scan the repository's source)
-            $package = $this->updater->update($io, $config, $package, $repository, $flags, $existingVersions);
+            $package = $this->updater->update($io, $config, $package, $repository, $flags, $existingVersions, $versionCache);
 
             $emptyRefCache = $em->merge($emptyRefCache);
             $emptyRefCache->setEmptyReferences($repository->getEmptyReferences());
@@ -156,6 +158,7 @@ class UpdaterWorker
                     'message' => 'Update of '.$packageName.' failed, package appears to be gone',
                     'details' => '<pre>'.$output.'</pre>',
                     'exception' => $e,
+                    'vendor' => $packageVendor,
                 ];
             }
 
@@ -168,6 +171,7 @@ class UpdaterWorker
                     'message' => 'Update of '.$packageName.' failed, invalid composer.json metadata',
                     'details' => '<pre>'.$output.'</pre>',
                     'exception' => $e,
+                    'vendor' => $packageVendor,
                 ];
             }
 
@@ -191,6 +195,16 @@ class UpdaterWorker
             } elseif ($e instanceof TransportException && preg_match('{https://api.bitbucket.org/2.0/repositories/[^/]+/.+?\?fields=-project}i', $e->getMessage()) && $e->getStatusCode() == 404) {
                 // bitbucket api root returns a 404
                 $found404 = true;
+            } elseif ($e instanceof \RuntimeException && preg_match('{fatal: repository \'[^\']+\' not found\n}i', $e->getMessage())) {
+                // random git clone failures
+                $found404 = true;
+            } elseif ($e instanceof \RuntimeException && (
+                preg_match('{fatal: could not read Username for \'[^\']+\': No such device or address\n}i', $e->getMessage())
+                || preg_match('{fatal: unable to access \'[^\']+\': Could not resolve host: }i', $e->getMessage())
+                || preg_match('{Can\'t connect to host \'[^\']+\': Connection timed out}i', $e->getMessage())
+            )) {
+                // unreachable host, skip for a week as this may be a temporary failure
+                $found404 = new \DateTime('+7 days');
             }
 
             // github 404'ed, check through API whether the package still exists and delete if not
@@ -202,7 +216,7 @@ class UpdaterWorker
 
             // detected a 404 so mark the package as gone and prevent updates for 1y
             if ($found404) {
-                $package->setCrawledAt(new \DateTime('+1 year'));
+                $package->setCrawledAt($found404 === true ? new \DateTime('+1 year') : $found404);
                 $this->doctrine->getEntityManager()->flush($package);
 
                 return [
@@ -210,6 +224,7 @@ class UpdaterWorker
                     'message' => 'Update of '.$packageName.' failed, package appears to be 404/gone and has been marked as crawled for 1year',
                     'details' => '<pre>'.$output.'</pre>',
                     'exception' => $e,
+                    'vendor' => $packageVendor,
                 ];
             }
 
@@ -218,7 +233,8 @@ class UpdaterWorker
                 return [
                     'status' => Job::STATUS_FAILED,
                     'message' => 'Package data of '.$packageName.' could not be downloaded. Could not reach remote VCS server. Please try again later.',
-                    'exception' => $e
+                    'exception' => $e,
+                    'vendor' => $packageVendor,
                 ];
             }
 
@@ -227,7 +243,8 @@ class UpdaterWorker
                 return [
                     'status' => Job::STATUS_FAILED,
                     'message' => 'Package data of '.$packageName.' could not be downloaded.',
-                    'exception' => $e
+                    'exception' => $e,
+                    'vendor' => $packageVendor,
                 ];
             }
 
@@ -239,10 +256,15 @@ class UpdaterWorker
             $this->locker->unlockPackageUpdate($id);
         }
 
+        if ($packageName === FriendsOfPhpSecurityAdvisoriesSource::SECURITY_PACKAGE) {
+            $this->scheduler->scheduleSecurityAdvisory(FriendsOfPhpSecurityAdvisoriesSource::SOURCE_NAME);
+        }
+
         return [
             'status' => Job::STATUS_COMPLETED,
             'message' => 'Update of '.$packageName.' complete',
-            'details' => '<pre>'.$this->cleanupOutput($io->getOutput()).'</pre>'
+            'details' => '<pre>'.$this->cleanupOutput($io->getOutput()).'</pre>',
+            'vendor' => $packageVendor,
         ];
     }
 
@@ -275,6 +297,7 @@ class UpdaterWorker
                             'message' => 'Update of '.$package->getName().' failed, package appears to be 404/gone and has been deleted',
                             'details' => '<pre>'.$output.'</pre>',
                             'exception' => $e,
+                            'vendor' => $package->getVendor()
                         ];
                     }
                 } catch (\Throwable $e) {

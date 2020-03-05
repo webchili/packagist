@@ -12,15 +12,21 @@
 
 namespace Packagist\WebBundle\Entity;
 
-use Doctrine\ORM\EntityRepository;
 use Doctrine\ORM\QueryBuilder;
 use Doctrine\DBAL\Cache\QueryCacheProfile;
+use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
+use Symfony\Bridge\Doctrine\RegistryInterface;
 
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
  */
-class PackageRepository extends EntityRepository
+class PackageRepository extends ServiceEntityRepository
 {
+    public function __construct(RegistryInterface $registry)
+    {
+        parent::__construct($registry, Package::class);
+    }
+
     public function findProviders($name)
     {
         $query = $this->createQueryBuilder('p')
@@ -104,6 +110,19 @@ class PackageRepository extends EntityRepository
             ->setParameters(['userId' => $userId, 'repoUrl' => 'https://github.com/%']);
 
         return $query->getResult();
+    }
+
+    public function isPackageMaintainedBy(Package $package, int $userId)
+    {
+        $query = $this->createQueryBuilder('p')
+            ->select('p.id')
+            ->join('p.maintainers', 'm')
+            ->where('m.id = :userId')
+            ->andWhere('p.id = :package')
+            ->getQuery()
+            ->setParameters(['userId' => $userId, 'package' => $package]);
+
+        return (bool) $query->getOneOrNullResult();
     }
 
     public function getPackagesWithFields($filters, $fields)
@@ -212,7 +231,7 @@ class PackageRepository extends EntityRepository
         // this helps for packages like https://packagist.org/packages/ccxt/ccxt
         // with huge amounts of versions
         $qb = $this->getEntityManager()->createQueryBuilder();
-        $qb->select('partial p.{id}', 'partial v.{id, version, normalizedVersion, development, releasedAt}', 'partial m.{id, username, email}')
+        $qb->select('partial p.{id}', 'partial v.{id, version, normalizedVersion, development, releasedAt, extra}', 'partial m.{id, username, email}')
             ->from('Packagist\WebBundle\Entity\Package', 'p')
             ->leftJoin('p.versions', 'v')
             ->leftJoin('p.maintainers', 'm')
@@ -295,6 +314,8 @@ class PackageRepository extends EntityRepository
             $qb->leftJoin('v.tags', 't');
         }
 
+        $qb->andWhere('(p.replacementPackage IS NULL OR p.replacementPackage != \'spam/spam\')');
+
         $qb->orderBy('p.abandoned');
         if (true === $orderByName) {
             $qb->addOrderBy('p.name');
@@ -331,7 +352,36 @@ class PackageRepository extends EntityRepository
         return true;
     }
 
-    public function getDependentCount($name)
+    public function markPackageSuspect(Package $package)
+    {
+        $sql = 'UPDATE package SET suspect = :suspect WHERE id = :id';
+        $this->getEntityManager()->getConnection()->executeUpdate($sql, ['suspect' => $package->getSuspect(), 'id' => $package->getId()]);
+    }
+
+    public function getSuspectPackageCount()
+    {
+        $sql = 'SELECT COUNT(*) count FROM package p WHERE p.suspect IS NOT NULL AND (p.replacementPackage IS NULL OR p.replacementPackage != "spam/spam")';
+
+        $stmt = $this->getEntityManager()->getConnection()->executeQuery($sql);
+        $result = $stmt->fetchAll();
+        $stmt->closeCursor();
+
+        return (int) $result[0]['count'];
+    }
+
+    public function getSuspectPackages($offset = 0, $limit = 15)
+    {
+        $sql = 'SELECT p.id, p.name, p.description, p.language, p.abandoned, p.replacementPackage
+            FROM package p WHERE p.suspect IS NOT NULL AND (p.replacementPackage IS NULL OR p.replacementPackage != "spam/spam") ORDER BY p.createdAt DESC LIMIT '.((int)$limit).' OFFSET '.((int)$offset);
+
+        $stmt = $this->getEntityManager()->getConnection()->executeQuery($sql);
+        $result = $stmt->fetchAll();
+        $stmt->closeCursor();
+
+        return $result;
+    }
+
+    public function getDependantCount($name)
     {
         $sql = 'SELECT COUNT(*) count FROM (
                 SELECT pv.package_id FROM link_require r INNER JOIN package_version pv ON (pv.id = r.version_id AND pv.development = 1) WHERE r.packageName = :name
@@ -347,21 +397,30 @@ class PackageRepository extends EntityRepository
         return (int) $result[0]['count'];
     }
 
-    public function getDependents($name, $offset = 0, $limit = 15)
+    public function getDependents($name, $offset = 0, $limit = 15, $orderBy = 'name')
     {
+        $orderByField = 'p.name ASC';
+        $join = '';
+        if ($orderBy === 'downloads') {
+            $orderByField = 'd.total DESC';
+            $join = 'LEFT JOIN download d ON d.id = p.id AND d.type = '.Download::TYPE_PACKAGE;
+        } else {
+            $orderBy = 'name';
+        }
+
         $sql = 'SELECT p.id, p.name, p.description, p.language, p.abandoned, p.replacementPackage
             FROM package p INNER JOIN (
                 SELECT pv.package_id FROM link_require r INNER JOIN package_version pv ON (pv.id = r.version_id AND pv.development = 1) WHERE r.packageName = :name
                 UNION
                 SELECT pv.package_id FROM link_require_dev r INNER JOIN package_version pv ON (pv.id = r.version_id AND pv.development = 1) WHERE r.packageName = :name
-            ) x ON x.package_id = p.id ORDER BY p.name ASC LIMIT '.((int)$limit).' OFFSET '.((int)$offset);
+            ) x ON x.package_id = p.id '.$join.' ORDER BY '.$orderByField.' LIMIT '.((int)$limit).' OFFSET '.((int)$offset);
 
         $stmt = $this->getEntityManager()->getConnection()
             ->executeCacheQuery(
                 $sql,
                 ['name' => $name],
                 [],
-                new QueryCacheProfile(7*86400, 'dependents_'.$name.'_'.$offset.'_'.$limit, $this->getEntityManager()->getConfiguration()->getResultCacheImpl())
+                new QueryCacheProfile(7*86400, 'dependents_'.$name.'_'.$offset.'_'.$limit.'_'.$orderBy, $this->getEntityManager()->getConfiguration()->getResultCacheImpl())
             );
         $result = $stmt->fetchAll();
         $stmt->closeCursor();

@@ -2,9 +2,14 @@
 
 {% import "PackagistWebBundle::macros.html.twig" as macros %}
 
-{% set isActualUser = app.user and app.user.username is same as(user.username) %}
+{% block head_additions %}
+    {% if user.hasRole('ROLE_SPAMMER') %}
+        <meta name="robots" content="noindex, nofollow">
+    {% endif %}
+{% endblock %}
 
 {% block content %}
+{% set isActualUser = app.user and app.user.username is same as(user.username) %}
 <h2 class="title">
     {{ user.username }}
     <small>
@@ -14,6 +19,12 @@
         {{ 'user.member_since'|trans }}: {{ user.createdAt|date('M d, Y') }}
         {%- if is_granted('ROLE_ADMIN') %}
             <a href="mailto:{{ user.email }}">{{ user.email }}</a>
+        {%- endif %}
+        {%- if deleteForm is defined and (is_granted('ROLE_ADMIN') or isActualUser) %}
+            <form class="delete action" action="{{ path('user_delete', {name: user.username}) }}" method="POST">
+                {{ form_widget(deleteForm._token) }}
+                <input class="btn btn-danger" type="submit" value="Delete Account Permanently" onclick="return confirm('Are you sure? There is no way back..');" />
+            </form>
         {%- endif %}
         {%- if is_granted('ROLE_ANTISPAM') %}
             <form class="delete action" action="{{ path('mark_spammer', {name: user.username}) }}" method="POST">

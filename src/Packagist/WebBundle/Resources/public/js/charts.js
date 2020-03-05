@@ -87,16 +87,47 @@
     });
 
     window.initPackageStats = function (average, date, versions, statsUrl, versionStatsUrl) {
+        colors = [
+            '#f28d1a',
+            '#1765f4',
+            '#ed1f96',
+            '#ee1e23',
+            '#b817f4',
+            '#c4f516',
+            '#804040',
+            '#ff8040',
+            '#008080',
+            '#004080',
+            '#8080ff',
+            '#800040',
+            '#800000',
+        ];
+
         var match,
             hash = document.location.hash,
             versionCache = {},
             ongoingRequest = false;
 
         function initChart(type, res) {
+            var key, series = [];
+
+            for (key in res.values) {
+                if (res.values.hasOwnProperty(key)) {
+                    series.push({name: key, values: res.values[key]});
+                }
+            }
+
+            series.sort(function (a, b) {
+                if (a.name.indexOf('.')) {
+                    return b.name.replace(/^\d+\./, '').localeCompare(a.name.replace(/^\d+\./, ''), undefined, {numeric: true});
+                }
+                return b.name.localeCompare(a.name, undefined, {numeric: true});
+            })
+
             initPackagistChart(
                 $('.js-'+type+'-dls')[0],
                 res.labels,
-                [{name: 'Daily Downloads', values: res.values}],
+                series,
                 true
             );
         }
@@ -119,6 +150,28 @@
             });
         }
 
+        function toggleStatsType(statsType) {
+            $('.package .stats-toggler.open').removeClass('open');
+            $('.package .stats-toggler[data-stats-type=' + statsType + ']').addClass('open');
+
+            $('.package .stats-wrapper').hide();
+            $('.package .stats-wrapper[data-stats-type=' + statsType + ']').show();
+
+            initializeVersionListExpander();
+        }
+
+        function initializeVersionListExpander() {
+            var versionsList = $('.package .versions')[0];
+            if (versionsList.offsetHeight < versionsList.scrollHeight) {
+                $('.package .versions-expander').removeClass('hidden').on('click', function () {
+                    $(this).addClass('hidden');
+                    $(versionsList).css('max-height', 'inherit');
+                });
+            } else {
+                $('.package .versions-expander').addClass('hidden')
+            }
+        }
+
         // initializer for #<version-id> present on page load
         if (hash.length > 1) {
             hash = hash.substring(1);
@@ -126,12 +179,24 @@
             if (match.length) {
                 $('.package .details-toggler.open').removeClass('open');
                 match.addClass('open');
+
+                toggleStatsType(match.closest('[data-stats-type]').attr('data-stats-type'));
             }
+        } else {
+            match = $('.package .details-toggler.open');
+            toggleStatsType(match.closest('[data-stats-type]').attr('data-stats-type'));
         }
 
         if ($('.package .details-toggler.open').length) {
             loadVersionChart($('.package .details-toggler.open').attr('data-version-id'));
         }
+
+        $('.package .stats-toggler').on('click', function () {
+            var target = $(this);
+            toggleStatsType($(this).attr('data-stats-type'));
+
+            $('.package .details-toggler[data-version-id="' + target.attr('href').substr(1) + '"]').trigger('click');
+        });
 
         $('.package .details-toggler').on('click', function () {
             var res, target = $(this), versionId = target.attr('data-version-id');
@@ -157,13 +222,6 @@
             $('.version-stats-chart').css('top', Math.max(0, Math.min(footerPadding, window.scrollY - basePos + headerPadding)) + 'px');
         });
 
-        // initialize version list expander
-        var versionsList = $('.package .versions')[0];
-        if (versionsList.offsetHeight < versionsList.scrollHeight) {
-            $('.package .versions-expander').removeClass('hidden').on('click', function () {
-                $(this).addClass('hidden');
-                $(versionsList).css('max-height', 'inherit');
-            });
-        }
+        initializeVersionListExpander();
     };
 })(jQuery);
