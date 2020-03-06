@@ -49,7 +49,7 @@ doctrine:
         password: '%database_password%'
         charset:  utf8mb4
         # See https://github.com/sonata-project/SonataAdminBundle/issues/3342
-        server_version: 5.5
+        server_version: 8.0
         options:
             # PDO::ATTR_TIMEOUT
             2: 1.3
